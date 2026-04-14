@@ -42,6 +42,34 @@ struct RadioStation: Identifiable, Codable {
     }
 }
 
+// MARK: - Station Metadata Helpers
+
+extension RadioStation {
+    /// Extracts FM frequency from station name, e.g. "KEXP 90.3 FM Seattle" → "90.3 FM"
+    var fmFrequency: String? {
+        let pattern = #"(\d{2,3}(?:\.\d{1,2})?)\s*[Ff][Mm]"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)),
+              let freqRange = Range(match.range(at: 1), in: name) else { return nil }
+        return "\(name[freqRange]) FM"
+    }
+
+    /// Compact grey metadata string using "/" as divider; omits blank fields.
+    /// Example: "90.3 FM / US / ambient / chill / MP3 / 128k"
+    var metadataDisplayString: String {
+        var parts: [String] = []
+        if let freq = fmFrequency         { parts.append(freq) }
+        if !country.isEmpty               { parts.append(country.uppercased()) }
+        tags.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .forEach { parts.append($0) }
+        if !codec.isEmpty                 { parts.append(codec.uppercased()) }
+        if bitrate > 0                    { parts.append("\(bitrate)k") }
+        return parts.joined(separator: " / ")
+    }
+}
+
 // MARK: - Hardcoded Favorites
 
 struct FavoriteStations {
@@ -1430,17 +1458,26 @@ struct TerminalStationRow: View {
                 .clipped()
                 .animation(pushSpring, value: isSelected)
 
-            // Station name — marquees when selected
-            MarqueeText(
-                text: station.name,
-                font: terminalFont,
-                color: isPlaying ? Color(red: 0.98, green: 0.25, blue: 0.65) : .white,
-                isActive: isSelected,
-                speed: 30,
-                startDelay: 1.0,
-                cycleDelay: 1.0
-            )
-            .animation(pushSpring, value: isSelected)
+            // Station name — fixed (no scroll); metadata scrolls to the right
+            let metaStr = station.metadataDisplayString
+            Text(station.name)
+                .font(terminalFont)
+                .foregroundColor(isPlaying ? Color(red: 0.98, green: 0.25, blue: 0.65) : .white)
+                .lineLimit(1)
+                .animation(pushSpring, value: isSelected)
+
+            if !metaStr.isEmpty {
+                MarqueeText(
+                    text: metaStr,
+                    font: terminalFont,
+                    color: Color.white.opacity(0.4),
+                    isActive: isSelected,
+                    speed: 30,
+                    startDelay: 1.0,
+                    cycleDelay: 1.0
+                )
+                .animation(pushSpring, value: isSelected)
+            }
         }
         .scaleEffect(scale, anchor: .leading)
         .contentShape(Rectangle())
@@ -1659,15 +1696,25 @@ struct AllStationsStationRow: View {
                             .fill(textColor)
                             .frame(width: 7, height: 8)
                     }
-                    MarqueeText(
-                        text: station.name,
-                        font: terminalFont,
-                        color: textColor,
-                        isActive: isSelected,
-                        speed: 30,
-                        startDelay: 1.0,
-                        cycleDelay: 1.0
-                    )
+                    // Station name — fixed (no scroll)
+                    let metaStr = station.metadataDisplayString
+                    Text(station.name)
+                        .font(terminalFont)
+                        .foregroundColor(textColor)
+                        .lineLimit(1)
+
+                    // Metadata — scrolls to the right in grey
+                    if !metaStr.isEmpty {
+                        MarqueeText(
+                            text: metaStr,
+                            font: terminalFont,
+                            color: Color(red: 0.55, green: 0.55, blue: 0.55),
+                            isActive: isSelected,
+                            speed: 30,
+                            startDelay: 1.0,
+                            cycleDelay: 1.0
+                        )
+                    }
                 }
             }
             .padding(6)
@@ -1949,19 +1996,27 @@ struct ContentView: View {
     private var nowPlayingSection: some View {
         VStack(spacing: 8) {
             // Header
-            HStack {
-                MarqueeText(
-                    text: audio.isPlaying && !audio.isPaused
-                         ? (audio.currentStation?.name ?? "Playing")
-                         : "Not Playing",
-                    font: terminalFont,
-                    color: .white,
-                    isActive: audio.isPlaying && !audio.isPaused,
-                    speed: 30,
-                    startDelay: 10.0,
-                    cycleDelay: 10.0
-                )
-                Spacer()
+            HStack(spacing: 4) {
+                let isActive = audio.isPlaying && !audio.isPaused
+                let nameText = isActive ? (audio.currentStation?.name ?? "Playing") : "Not Playing"
+                let metaText = isActive ? (audio.currentStation?.metadataDisplayString ?? "") : ""
+
+                Text(nameText)
+                    .font(terminalFont)
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+
+                if !metaText.isEmpty {
+                    MarqueeText(
+                        text: metaText,
+                        font: terminalFont,
+                        color: Color.white.opacity(0.4),
+                        isActive: isActive,
+                        speed: 30,
+                        startDelay: 10.0,
+                        cycleDelay: 10.0
+                    )
+                }
             }
 
             ThinDivider()
