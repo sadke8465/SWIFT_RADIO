@@ -12,7 +12,7 @@ import UniformTypeIdentifiers
 
 // MARK: - Radio Station Model
 
-struct RadioStation: Identifiable, Decodable {
+struct RadioStation: Identifiable, Codable {
     let id: String
     let name: String
     let url: String
@@ -130,12 +130,26 @@ class AllStationsState: ObservableObject {
     @Published var selectedStationIndex = 0
     @Published var isSearching = false
     @Published var searchText = ""
-    @Published var localFavorites: Set<String> = []
+    @Published var favoriteStations: [RadioStation] = []
     @Published var isLoading = false
     @Published var currentStations: [RadioStation] = []
 
+    var localFavorites: Set<String> {
+        Set(favoriteStations.map { $0.id })
+    }
+
     private var genreCache: [Int: [RadioStation]] = [:]
     private let baseURL = "https://de1.api.radio-browser.info/json"
+    private let favoritesKey = "savedFavoriteStations"
+
+    init() {
+        if let data = UserDefaults.standard.data(forKey: "savedFavoriteStations"),
+           let stations = try? JSONDecoder().decode([RadioStation].self, from: data) {
+            favoriteStations = stations
+        } else {
+            favoriteStations = FavoriteStations.all
+        }
+    }
 
     var filteredStations: [RadioStation] {
         if isSearching && !searchText.isEmpty {
@@ -241,9 +255,19 @@ class AllStationsState: ObservableObject {
     func toggleFavorite() {
         let stations = filteredStations
         guard selectedStationIndex < stations.count else { return }
-        let id = stations[selectedStationIndex].id
-        if localFavorites.contains(id) { localFavorites.remove(id) }
-        else { localFavorites.insert(id) }
+        let station = stations[selectedStationIndex]
+        if localFavorites.contains(station.id) {
+            favoriteStations.removeAll { $0.id == station.id }
+        } else {
+            favoriteStations.append(station)
+        }
+        saveFavorites()
+    }
+
+    private func saveFavorites() {
+        if let data = try? JSONEncoder().encode(favoriteStations) {
+            UserDefaults.standard.set(data, forKey: favoritesKey)
+        }
     }
 }
 
@@ -1843,7 +1867,6 @@ struct ContentView: View {
     @State private var showAllStations: Bool = false
 
 
-    private let favorites = FavoriteStations.all
     private let debugPanel = DebugPanelController()
     private let frameTimer = Timer.publish(every: 1.0 / 120.0, on: .main, in: .common).autoconnect()
 
@@ -1975,7 +1998,7 @@ struct ContentView: View {
 
             // Station list
             VStack(alignment: .leading, spacing: 4) {
-                ForEach(Array(favorites.enumerated()), id: \.element.id) { idx, station in
+                ForEach(Array(allStationsState.favoriteStations.enumerated()), id: \.element.id) { idx, station in
                     TerminalStationRow(
                         station: station,
                         index: idx,
@@ -1993,14 +2016,14 @@ struct ContentView: View {
                 Text(">")
                     .font(terminalFont)
                     .foregroundColor(.white)
-                    .opacity(selectedIndex == favorites.count ? 1 : 0)
-                    .frame(width: selectedIndex == favorites.count ? 10 : 0, alignment: .leading)
+                    .opacity(selectedIndex == allStationsState.favoriteStations.count ? 1 : 0)
+                    .frame(width: selectedIndex == allStationsState.favoriteStations.count ? 10 : 0, alignment: .leading)
                     .clipped()
-                    .animation(pushSpring, value: selectedIndex == favorites.count)
+                    .animation(pushSpring, value: selectedIndex == allStationsState.favoriteStations.count)
                 Text("All Stations")
                     .font(terminalFont)
                     .foregroundColor(.white)
-                    .animation(pushSpring, value: selectedIndex == favorites.count)
+                    .animation(pushSpring, value: selectedIndex == allStationsState.favoriteStations.count)
             }
             .contentShape(Rectangle())
             .onTapGesture {
@@ -2037,18 +2060,18 @@ struct ContentView: View {
                 return true
 
             case 125: // Down arrow
-                if selectedIndex < favorites.count {
+                if selectedIndex < allStationsState.favoriteStations.count {
                     selectedIndex += 1
                 }
                 return true
 
             case 36: // Enter / Return
-                if selectedIndex == favorites.count {
+                if selectedIndex == allStationsState.favoriteStations.count {
                     enterAllStations()
                     return true
                 }
-                if selectedIndex < favorites.count {
-                    audio.playStation(favorites[selectedIndex])
+                if selectedIndex < allStationsState.favoriteStations.count {
+                    audio.playStation(allStationsState.favoriteStations[selectedIndex])
                 }
                 return true
 
@@ -2209,18 +2232,19 @@ struct ContentView: View {
             showAllStations = false
         }
         allStationsState.reset()
-        selectedIndex = favorites.count
+        selectedIndex = allStationsState.favoriteStations.count
     }
 
     private func sweepStation(direction: Int) {
-        guard !favorites.isEmpty else { return }
+        let favs = allStationsState.favoriteStations
+        guard !favs.isEmpty else { return }
 
         var newIndex = selectedIndex + direction
-        if newIndex < 0 { newIndex = favorites.count - 1 }
-        if newIndex >= favorites.count { newIndex = 0 }
+        if newIndex < 0 { newIndex = favs.count - 1 }
+        if newIndex >= favs.count { newIndex = 0 }
 
         selectedIndex = newIndex
-        audio.playStation(favorites[newIndex])
+        audio.playStation(favs[newIndex])
     }
 
     // MARK: - Visualizer calculations
