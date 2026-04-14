@@ -131,6 +131,7 @@ class AllStationsState: ObservableObject {
     @Published var isSearching = false
     @Published var searchText = ""
     @Published var favoriteStations: [RadioStation] = []
+    @Published var recentStations: [RadioStation] = []
     @Published var isLoading = false
     @Published var currentStations: [RadioStation] = []
 
@@ -141,6 +142,7 @@ class AllStationsState: ObservableObject {
     private var genreCache: [Int: [RadioStation]] = [:]
     private let baseURL = "https://de1.api.radio-browser.info/json"
     private let favoritesKey = "savedFavoriteStations"
+    private let recentsKey = "savedRecentStations"
 
     init() {
         if let data = UserDefaults.standard.data(forKey: "savedFavoriteStations"),
@@ -148,6 +150,10 @@ class AllStationsState: ObservableObject {
             favoriteStations = stations
         } else {
             favoriteStations = FavoriteStations.all
+        }
+        if let data = UserDefaults.standard.data(forKey: "savedRecentStations"),
+           let stations = try? JSONDecoder().decode([RadioStation].self, from: data) {
+            recentStations = stations
         }
     }
 
@@ -267,6 +273,21 @@ class AllStationsState: ObservableObject {
     private func saveFavorites() {
         if let data = try? JSONEncoder().encode(favoriteStations) {
             UserDefaults.standard.set(data, forKey: favoritesKey)
+        }
+    }
+
+    func addRecent(_ station: RadioStation) {
+        recentStations.removeAll { $0.id == station.id }
+        recentStations.insert(station, at: 0)
+        if recentStations.count > 20 {
+            recentStations = Array(recentStations.prefix(20))
+        }
+        saveRecents()
+    }
+
+    private func saveRecents() {
+        if let data = try? JSONEncoder().encode(recentStations) {
+            UserDefaults.standard.set(data, forKey: recentsKey)
         }
     }
 }
@@ -1385,6 +1406,7 @@ struct TerminalStationRow: View {
     @Binding var selectedIndex: Int
     @ObservedObject var audio: AudioManager
     let terminalFont: Font
+    var onPlay: (() -> Void)? = nil
 
     @State private var scale: CGFloat = 1.0
 
@@ -1426,6 +1448,7 @@ struct TerminalStationRow: View {
             scale = 0.97
             selectedIndex = index
             audio.playStation(station)
+            onPlay?()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) {
                 withAnimation(squishSpring) { scale = 1.0 }
             }
@@ -1810,6 +1833,7 @@ struct AllStationsView: View {
                     .onTapGesture {
                         state.selectedStationIndex = idx
                         audio.playStation(station)
+                        state.addRecent(station)
                     }
                 }
             }
@@ -1865,6 +1889,8 @@ struct ContentView: View {
     @State private var displayAmplitudes: [CGFloat] = Array(repeating: 0, count: 6)
     @State private var selectedIndex: Int = 0
     @State private var showAllStations: Bool = false
+    @State private var showRecents: Bool = false
+    @StateObject private var recentsScroll = LiquidScrollState()
 
 
     private let debugPanel = DebugPanelController()
@@ -1981,53 +2007,33 @@ struct ContentView: View {
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
-    // MARK: - Favorites Section
+    // MARK: - Favorites / Recents Section
 
     private var favoritesSection: some View {
         let pushSpring = Animation.interpolatingSpring(stiffness: 280, damping: 28)
         return VStack(spacing: 8) {
-            // Header
+            // Header — left/right arrows indicate toggling is available
             HStack {
-                Text("Favorites")
+                Text("<")
+                    .font(terminalFont)
+                    .foregroundColor(.white.opacity(showRecents ? 1.0 : 0.25))
+                Spacer()
+                Text(showRecents ? "Recents" : "Favorites")
                     .font(terminalFont)
                     .foregroundColor(.white)
                 Spacer()
-            }
-
-            ThinDivider()
-
-            // Station list
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(Array(allStationsState.favoriteStations.enumerated()), id: \.element.id) { idx, station in
-                    TerminalStationRow(
-                        station: station,
-                        index: idx,
-                        selectedIndex: $selectedIndex,
-                        audio: audio,
-                        terminalFont: terminalFont
-                    )
-                }
-            }
-
-            ThinDivider()
-
-            // All Stations entry point (keyboard navigable)
-            HStack(spacing: 0) {
                 Text(">")
                     .font(terminalFont)
-                    .foregroundColor(.white)
-                    .opacity(selectedIndex == allStationsState.favoriteStations.count ? 1 : 0)
-                    .frame(width: selectedIndex == allStationsState.favoriteStations.count ? 10 : 0, alignment: .leading)
-                    .clipped()
-                    .animation(pushSpring, value: selectedIndex == allStationsState.favoriteStations.count)
-                Text("All Stations")
-                    .font(terminalFont)
-                    .foregroundColor(.white)
-                    .animation(pushSpring, value: selectedIndex == allStationsState.favoriteStations.count)
+                    .foregroundColor(.white.opacity(showRecents ? 0.25 : 1.0))
             }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                enterAllStations()
+            .animation(pushSpring, value: showRecents)
+
+            ThinDivider()
+
+            if showRecents {
+                recentsContent
+            } else {
+                favoritesContent(pushSpring: pushSpring)
             }
         }
         .padding(.horizontal, 6)
@@ -2036,7 +2042,104 @@ struct ContentView: View {
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
-    // MARK: - Station Row
+    @ViewBuilder
+    private func favoritesContent(pushSpring: Animation) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array(allStationsState.favoriteStations.enumerated()), id: \.element.id) { idx, station in
+                TerminalStationRow(
+                    station: station,
+                    index: idx,
+                    selectedIndex: $selectedIndex,
+                    audio: audio,
+                    terminalFont: terminalFont,
+                    onPlay: { allStationsState.addRecent(station) }
+                )
+            }
+        }
+
+        ThinDivider()
+
+        // All Stations entry point (keyboard navigable)
+        HStack(spacing: 0) {
+            Text(">")
+                .font(terminalFont)
+                .foregroundColor(.white)
+                .opacity(selectedIndex == allStationsState.favoriteStations.count ? 1 : 0)
+                .frame(width: selectedIndex == allStationsState.favoriteStations.count ? 10 : 0, alignment: .leading)
+                .clipped()
+                .animation(pushSpring, value: selectedIndex == allStationsState.favoriteStations.count)
+            Text("All Stations")
+                .font(terminalFont)
+                .foregroundColor(.white)
+                .animation(pushSpring, value: selectedIndex == allStationsState.favoriteStations.count)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            enterAllStations()
+        }
+    }
+
+    @ViewBuilder
+    private var recentsContent: some View {
+        if allStationsState.recentStations.isEmpty {
+            Spacer()
+            Text("No recent stations")
+                .font(terminalFont)
+                .foregroundColor(.white.opacity(0.4))
+            Spacer()
+        } else {
+            GeometryReader { outerGeo in
+                let viewportH = outerGeo.size.height
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(allStationsState.recentStations.enumerated()), id: \.element.id) { idx, station in
+                        TerminalStationRow(
+                            station: station,
+                            index: idx,
+                            selectedIndex: $selectedIndex,
+                            audio: audio,
+                            terminalFont: terminalFont,
+                            onPlay: { allStationsState.addRecent(station) }
+                        )
+                    }
+                }
+                .background(
+                    GeometryReader { contentGeo in
+                        Color.clear
+                            .onAppear {
+                                recentsScroll.updateGeometry(
+                                    contentHeight: contentGeo.size.height,
+                                    viewportHeight: viewportH
+                                )
+                            }
+                            .onChange(of: contentGeo.size.height) { h in
+                                recentsScroll.updateGeometry(
+                                    contentHeight: h,
+                                    viewportHeight: viewportH
+                                )
+                            }
+                    }
+                )
+                .offset(y: -recentsScroll.offset)
+                .frame(width: outerGeo.size.width, height: viewportH, alignment: .topLeading)
+                .clipped()
+                .onChange(of: selectedIndex) { newIdx in
+                    recentsScroll.scrollToIndex(
+                        newIdx,
+                        totalItems: allStationsState.recentStations.count
+                    )
+                }
+                .onChange(of: allStationsState.recentStations.count) { _ in
+                    recentsScroll.jumpToTop()
+                }
+                .onAppear {
+                    recentsScroll.updateGeometry(
+                        contentHeight: recentsScroll.contentHeight,
+                        viewportHeight: viewportH
+                    )
+                }
+            }
+        }
+    }
 
     // MARK: - Station Row (terminal-style with animated chevron push)
     // Replaced by TerminalStationRow struct below
@@ -2060,18 +2163,34 @@ struct ContentView: View {
                 return true
 
             case 125: // Down arrow
-                if selectedIndex < allStationsState.favoriteStations.count {
-                    selectedIndex += 1
+                if showRecents {
+                    if selectedIndex < allStationsState.recentStations.count - 1 {
+                        selectedIndex += 1
+                    }
+                } else {
+                    if selectedIndex < allStationsState.favoriteStations.count {
+                        selectedIndex += 1
+                    }
                 }
                 return true
 
             case 36: // Enter / Return
+                if showRecents {
+                    if selectedIndex < allStationsState.recentStations.count {
+                        let s = allStationsState.recentStations[selectedIndex]
+                        audio.playStation(s)
+                        allStationsState.addRecent(s)
+                    }
+                    return true
+                }
                 if selectedIndex == allStationsState.favoriteStations.count {
                     enterAllStations()
                     return true
                 }
                 if selectedIndex < allStationsState.favoriteStations.count {
-                    audio.playStation(allStationsState.favoriteStations[selectedIndex])
+                    let s = allStationsState.favoriteStations[selectedIndex]
+                    audio.playStation(s)
+                    allStationsState.addRecent(s)
                 }
                 return true
 
@@ -2084,14 +2203,20 @@ struct ContentView: View {
                     sweepStation(direction: -1)
                     return true
                 }
-                return false
+                withAnimation(portalCurve) { showRecents.toggle() }
+                selectedIndex = 0
+                if showRecents { recentsScroll.jumpToTop() }
+                return true
 
             case 124: // Right arrow
                 if shift {
                     sweepStation(direction: 1)
                     return true
                 }
-                return false
+                withAnimation(portalCurve) { showRecents.toggle() }
+                selectedIndex = 0
+                if showRecents { recentsScroll.jumpToTop() }
+                return true
 
             case 2: // 'D' key — toggle debug panel
                 debugPanel.toggle(settings: settings, audio: audio)
@@ -2129,7 +2254,9 @@ struct ContentView: View {
         case 36: // Enter — play selected
             let stations = allStationsState.filteredStations
             if allStationsState.selectedStationIndex < stations.count {
-                audio.playStation(stations[allStationsState.selectedStationIndex])
+                let s = stations[allStationsState.selectedStationIndex]
+                audio.playStation(s)
+                allStationsState.addRecent(s)
             }
             return true
         case 126: // Up
@@ -2195,7 +2322,9 @@ struct ContentView: View {
         case 36: // Enter — play selected station
             let stations = allStationsState.filteredStations
             if allStationsState.selectedStationIndex < stations.count {
-                audio.playStation(stations[allStationsState.selectedStationIndex])
+                let s = stations[allStationsState.selectedStationIndex]
+                audio.playStation(s)
+                allStationsState.addRecent(s)
             }
             return true
         case 1: // S key — toggle search
@@ -2245,6 +2374,7 @@ struct ContentView: View {
 
         selectedIndex = newIndex
         audio.playStation(favs[newIndex])
+        allStationsState.addRecent(favs[newIndex])
     }
 
     // MARK: - Visualizer calculations
