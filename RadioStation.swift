@@ -1556,6 +1556,9 @@ class LiquidScrollState: ObservableObject {
     @Published var offset: CGFloat = 0
     /// Current scroll velocity (px/s) — used for motion blur
     @Published var velocity: CGFloat = 0
+    /// Extra transparent padding added below the list so maxOffset is slot-aligned.
+    /// Observed by the view to size a Color.clear spacer.
+    @Published private(set) var bottomAlignmentPadding: CGFloat = 0
 
     /// Spring parameters — critically damped (ζ ≥ 1.0, no jiggle per Bible Law #2)
     private let stiffness: CGFloat = 300
@@ -1569,21 +1572,58 @@ class LiquidScrollState: ObservableObject {
     private var isAnimating = false
     private let linkID = UUID()
 
-    private(set) var contentHeight: CGFloat = 0
+    /// Raw measured height of the item VStack (not including the alignment spacer)
+    private var rawContentHeight: CGFloat = 0
     private(set) var viewportHeight: CGFloat = 0
+    private var itemCount: Int = 0
 
     /// Estimated row height (updated dynamically from first measurement)
     var estimatedRowHeight: CGFloat = 32
     /// Spacing between rows
     var rowSpacing: CGFloat = 5
 
+    /// Slot height = rowHeight + spacing, derived from the raw item content only.
+    /// slotHeight = (rawContentHeight + 4) / itemCount  because:
+    ///   rawContentHeight = itemCount * rowHeight + (itemCount - 1) * 4
+    ///                    = itemCount * slotHeight - 4
+    private var slotHeight: CGFloat {
+        guard itemCount > 0, rawContentHeight > 0 else { return estimatedRowHeight + 4 }
+        return (rawContentHeight + 4) / CGFloat(itemCount)
+    }
+
+    /// Total content height presented to the physics engine (rows + alignment pad)
+    var contentHeight: CGFloat { rawContentHeight + bottomAlignmentPadding }
+
+    /// maxOffset is now always a multiple of slotHeight so every scroll target
+    /// lands on an exact row boundary — no top-item pixel clipping ever.
     var maxOffset: CGFloat {
         max(0, contentHeight - viewportHeight)
     }
 
-    func updateGeometry(contentHeight: CGFloat, viewportHeight: CGFloat) {
-        self.contentHeight = contentHeight
+    func updateGeometry(contentHeight: CGFloat, viewportHeight: CGFloat, itemCount: Int = 0) {
+        self.rawContentHeight = contentHeight
         self.viewportHeight = viewportHeight
+        if itemCount > 0 { self.itemCount = itemCount }
+        recomputePadding()
+    }
+
+    /// Call when item count changes independently (e.g. genre/search switch)
+    func updateItemCount(_ count: Int) {
+        itemCount = count
+        recomputePadding()
+    }
+
+    /// Recalculates bottomAlignmentPadding so that maxOffset = ceil(rawMax/slotHeight)*slotHeight.
+    /// With this invariant, every retarget() call lands on an exact row boundary.
+    private func recomputePadding() {
+        let sh = slotHeight
+        let rawMax = max(0, rawContentHeight - viewportHeight)
+        guard sh > 0, rawMax > 0 else {
+            bottomAlignmentPadding = 0
+            return
+        }
+        let rem = rawMax.truncatingRemainder(dividingBy: sh)
+        bottomAlignmentPadding = rem > 0 ? sh - rem : 0
     }
 
     /// Scroll so the selected item is fully visible, snapping to exact item boundaries.
@@ -1592,21 +1632,18 @@ class LiquidScrollState: ObservableObject {
     func scrollToIndex(_ index: Int, totalItems: Int) {
         guard totalItems > 0 else { return }
 
-        // slotHeight = rowHeight + spacing (VStack uses spacing: 4)
-        // contentHeight = totalItems * rowHeight + (totalItems - 1) * 4
-        //               = totalItems * slotHeight - 4
-        // => slotHeight = (contentHeight + 4) / totalItems
-        let spacing: CGFloat = 4
-        let slotHeight: CGFloat = contentHeight > 0
-            ? (contentHeight + spacing) / CGFloat(totalItems)
-            : estimatedRowHeight + spacing
+        if itemCount != totalItems {
+            itemCount = totalItems
+            recomputePadding()
+        }
 
+        let sh = slotHeight
         // How many complete items fit in the viewport
-        let visibleCount = max(1, Int((viewportHeight + spacing) / slotHeight))
+        let visibleCount = max(1, Int((viewportHeight + 4) / sh))
 
         // Which item is currently the first visible one (targetOffset is always a
         // multiple of slotHeight, so this division is exact after the first scroll)
-        let currentFirstVisible = Int(targetOffset / slotHeight)
+        let currentFirstVisible = Int(targetOffset / sh)
 
         var newFirstVisible = currentFirstVisible
         if index < currentFirstVisible {
@@ -1619,10 +1656,11 @@ class LiquidScrollState: ObservableObject {
             return // Already fully visible; no scroll needed
         }
 
-        let maxFirstVisible = max(0, totalItems - visibleCount)
+        // maxOffset is slot-aligned, so dividing by sh gives an exact integer
+        let maxFirstVisible = max(0, Int((maxOffset / sh).rounded()))
         newFirstVisible = max(0, min(newFirstVisible, maxFirstVisible))
 
-        let newOffset = min(CGFloat(newFirstVisible) * slotHeight, maxOffset)
+        let newOffset = min(CGFloat(newFirstVisible) * sh, maxOffset)
         retarget(newOffset)
     }
 
@@ -1923,37 +1961,48 @@ struct AllStationsView: View {
         GeometryReader { outerGeo in
             let viewportH = outerGeo.size.height
 
-            // Custom spring-driven scroll — no ScrollView, the VStack moves via offset
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(Array(state.filteredStations.enumerated()), id: \.element.id) { idx, station in
-                    AllStationsStationRow(
-                        station: station,
-                        index: idx,
-                        selectedIndex: $state.selectedStationIndex,
-                        audio: audio,
-                        isFavorite: state.localFavorites.contains(station.id),
-                        terminalFont: terminalFont,
-                        onPlay: { state.addRecent(station) }
-                    )
+            // Custom spring-driven scroll — no ScrollView, the VStack moves via offset.
+            // Outer VStack: inner item rows + a transparent alignment spacer.
+            // The spacer is NOT included in the contentHeight measurement; it only
+            // extends the physics content so maxOffset is a multiple of slotHeight,
+            // which guarantees the first visible row is never pixel-clipped at the top.
+            VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(state.filteredStations.enumerated()), id: \.element.id) { idx, station in
+                        AllStationsStationRow(
+                            station: station,
+                            index: idx,
+                            selectedIndex: $state.selectedStationIndex,
+                            audio: audio,
+                            isFavorite: state.localFavorites.contains(station.id),
+                            terminalFont: terminalFont,
+                            onPlay: { state.addRecent(station) }
+                        )
+                    }
                 }
+                .background(
+                    GeometryReader { contentGeo in
+                        Color.clear
+                            .onAppear {
+                                liquidScroll.updateGeometry(
+                                    contentHeight: contentGeo.size.height,
+                                    viewportHeight: viewportH,
+                                    itemCount: state.filteredStations.count
+                                )
+                            }
+                            .onChange(of: contentGeo.size.height) { h in
+                                liquidScroll.updateGeometry(
+                                    contentHeight: h,
+                                    viewportHeight: viewportH,
+                                    itemCount: state.filteredStations.count
+                                )
+                            }
+                    }
+                )
+
+                // Slot-alignment spacer: makes maxOffset a multiple of slotHeight
+                Color.clear.frame(height: liquidScroll.bottomAlignmentPadding)
             }
-            .background(
-                GeometryReader { contentGeo in
-                    Color.clear
-                        .onAppear {
-                            liquidScroll.updateGeometry(
-                                contentHeight: contentGeo.size.height,
-                                viewportHeight: viewportH
-                            )
-                        }
-                        .onChange(of: contentGeo.size.height) { h in
-                            liquidScroll.updateGeometry(
-                                contentHeight: h,
-                                viewportHeight: viewportH
-                            )
-                        }
-                }
-            )
             .offset(y: -liquidScroll.offset)  // Spring-driven scroll offset
             .frame(width: outerGeo.size.width, height: viewportH, alignment: .topLeading)
             .clipped()  // Clip content outside viewport
@@ -1963,15 +2012,10 @@ struct AllStationsView: View {
                     totalItems: state.filteredStations.count
                 )
             }
-            .onChange(of: state.filteredStations.count) { _ in
-                // When stations change (genre switch, search), jump to top
+            .onChange(of: state.filteredStations.count) { count in
+                // When stations change (genre switch, search), update count then jump to top
+                liquidScroll.updateItemCount(count)
                 liquidScroll.jumpToTop()
-            }
-            .onAppear {
-                liquidScroll.updateGeometry(
-                    contentHeight: liquidScroll.contentHeight,
-                    viewportHeight: viewportH
-                )
             }
         }
     }
@@ -2195,40 +2239,51 @@ struct ContentView: View {
         } else {
             GeometryReader { outerGeo in
                 let viewportH = outerGeo.size.height
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(Array(allStationsState.favoriteStations.enumerated()), id: \.element.id) { idx, station in
-                        TerminalStationRow(
-                            station: station,
-                            index: idx,
-                            selectedIndex: $selectedIndex,
-                            audio: audio,
-                            terminalFont: terminalFont,
-                            onPlay: { allStationsState.addRecent(station) }
-                        )
+                VStack(alignment: .leading, spacing: 0) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(Array(allStationsState.favoriteStations.enumerated()), id: \.element.id) { idx, station in
+                            TerminalStationRow(
+                                station: station,
+                                index: idx,
+                                selectedIndex: $selectedIndex,
+                                audio: audio,
+                                terminalFont: terminalFont,
+                                onPlay: { allStationsState.addRecent(station) }
+                            )
+                        }
                     }
+                    .background(
+                        GeometryReader { contentGeo in
+                            Color.clear
+                                .onAppear {
+                                    favoritesScroll.updateGeometry(
+                                        contentHeight: contentGeo.size.height,
+                                        viewportHeight: viewportH,
+                                        itemCount: allStationsState.favoriteStations.count
+                                    )
+                                }
+                                .onChange(of: contentGeo.size.height) { h in
+                                    favoritesScroll.updateGeometry(
+                                        contentHeight: h,
+                                        viewportHeight: viewportH,
+                                        itemCount: allStationsState.favoriteStations.count
+                                    )
+                                }
+                        }
+                    )
+
+                    // Slot-alignment spacer: makes maxOffset a multiple of slotHeight
+                    Color.clear.frame(height: favoritesScroll.bottomAlignmentPadding)
                 }
-                .background(
-                    GeometryReader { contentGeo in
-                        Color.clear
-                            .onAppear {
-                                favoritesScroll.updateGeometry(contentHeight: contentGeo.size.height, viewportHeight: viewportH)
-                            }
-                            .onChange(of: contentGeo.size.height) { h in
-                                favoritesScroll.updateGeometry(contentHeight: h, viewportHeight: viewportH)
-                            }
-                    }
-                )
                 .offset(y: -favoritesScroll.offset)
                 .frame(width: outerGeo.size.width, height: viewportH, alignment: .topLeading)
                 .clipped()
                 .onChange(of: selectedIndex) { newIdx in
                     favoritesScroll.scrollToIndex(newIdx, totalItems: allStationsState.favoriteStations.count)
                 }
-                .onChange(of: allStationsState.favoriteStations.count) { _ in
+                .onChange(of: allStationsState.favoriteStations.count) { count in
+                    favoritesScroll.updateItemCount(count)
                     favoritesScroll.jumpToTop()
-                }
-                .onAppear {
-                    favoritesScroll.updateGeometry(contentHeight: favoritesScroll.contentHeight, viewportHeight: viewportH)
                 }
             }
             .frame(height: 96)
@@ -2273,35 +2328,42 @@ struct ContentView: View {
         } else {
             GeometryReader { outerGeo in
                 let viewportH = outerGeo.size.height
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(Array(allStationsState.recentStations.enumerated()), id: \.element.id) { idx, station in
-                        TerminalStationRow(
-                            station: station,
-                            index: idx,
-                            selectedIndex: $selectedIndex,
-                            audio: audio,
-                            terminalFont: terminalFont,
-                            onPlay: { allStationsState.addRecent(station) }
-                        )
+                VStack(alignment: .leading, spacing: 0) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(Array(allStationsState.recentStations.enumerated()), id: \.element.id) { idx, station in
+                            TerminalStationRow(
+                                station: station,
+                                index: idx,
+                                selectedIndex: $selectedIndex,
+                                audio: audio,
+                                terminalFont: terminalFont,
+                                onPlay: { allStationsState.addRecent(station) }
+                            )
+                        }
                     }
+                    .background(
+                        GeometryReader { contentGeo in
+                            Color.clear
+                                .onAppear {
+                                    recentsScroll.updateGeometry(
+                                        contentHeight: contentGeo.size.height,
+                                        viewportHeight: viewportH,
+                                        itemCount: allStationsState.recentStations.count
+                                    )
+                                }
+                                .onChange(of: contentGeo.size.height) { h in
+                                    recentsScroll.updateGeometry(
+                                        contentHeight: h,
+                                        viewportHeight: viewportH,
+                                        itemCount: allStationsState.recentStations.count
+                                    )
+                                }
+                        }
+                    )
+
+                    // Slot-alignment spacer: makes maxOffset a multiple of slotHeight
+                    Color.clear.frame(height: recentsScroll.bottomAlignmentPadding)
                 }
-                .background(
-                    GeometryReader { contentGeo in
-                        Color.clear
-                            .onAppear {
-                                recentsScroll.updateGeometry(
-                                    contentHeight: contentGeo.size.height,
-                                    viewportHeight: viewportH
-                                )
-                            }
-                            .onChange(of: contentGeo.size.height) { h in
-                                recentsScroll.updateGeometry(
-                                    contentHeight: h,
-                                    viewportHeight: viewportH
-                                )
-                            }
-                    }
-                )
                 .offset(y: -recentsScroll.offset)
                 .frame(width: outerGeo.size.width, height: viewportH, alignment: .topLeading)
                 .clipped()
@@ -2311,14 +2373,9 @@ struct ContentView: View {
                         totalItems: allStationsState.recentStations.count
                     )
                 }
-                .onChange(of: allStationsState.recentStations.count) { _ in
+                .onChange(of: allStationsState.recentStations.count) { count in
+                    recentsScroll.updateItemCount(count)
                     recentsScroll.jumpToTop()
-                }
-                .onAppear {
-                    recentsScroll.updateGeometry(
-                        contentHeight: recentsScroll.contentHeight,
-                        viewportHeight: viewportH
-                    )
                 }
             }
             .frame(height: 96)
