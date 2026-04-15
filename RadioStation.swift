@@ -2109,7 +2109,7 @@ struct ContentView: View {
                     .foregroundColor(.white)
                 Spacer()
             }
-            .padding(.bottom, 6)
+            .padding(.bottom, 4)
 
             ThinDivider()
 
@@ -2128,9 +2128,8 @@ struct ContentView: View {
                     cycleDelay: 10.0
                 )
             }
-            .padding(.vertical, 6)
-
-            ThinDivider()
+            .padding(.top, 4)
+            .padding(.bottom, 2)
 
             // << ■ >> transport controls (Figma: 1294:2372)
             HStack {
@@ -2153,11 +2152,10 @@ struct ContentView: View {
                     .contentShape(Rectangle())
                     .onTapGesture { sweepStation(direction: 1) }
             }
-            .padding(.top, 6)
         }
         .padding(.horizontal, 6)
-        .padding(.top, 8)
-        .padding(.bottom, 6)
+        .padding(.top, 6)
+        .padding(.bottom, 4)
         .background(panelBG)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
