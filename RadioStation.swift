@@ -1270,51 +1270,57 @@ struct MarqueeText: View {
     private var scrollDistance: CGFloat { textWidth + spacing }
 
     var body: some View {
-        GeometryReader { geo in
-            let cw = geo.size.width
+        ZStack(alignment: .leading) {
+            Text(text)
+                .font(font)
+                .lineLimit(1)
+                .hidden()
+                
+            GeometryReader { geo in
+                let cw = geo.size.width
 
-            HStack(spacing: spacing) {
-                Text(text)
-                    .font(font)
-                    .foregroundColor(color)
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .background(
-                        GeometryReader { tp in
-                            Color.clear.onAppear {
-                                textWidth = tp.size.width
-                                containerWidth = cw
-                            }
-                            .onChange(of: tp.size.width) { textWidth = $0 }
-                            .onChange(of: cw) { containerWidth = $0 }
-                        }
-                    )
-
-                if needsScroll {
+                HStack(spacing: spacing) {
                     Text(text)
                         .font(font)
                         .foregroundColor(color)
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
+                        .background(
+                            GeometryReader { tp in
+                                Color.clear.onAppear {
+                                    textWidth = tp.size.width
+                                    containerWidth = cw
+                                }
+                                .onChange(of: tp.size.width) { textWidth = $0 }
+                                .onChange(of: cw) { containerWidth = $0 }
+                            }
+                        )
+
+                    if needsScroll {
+                        Text(text)
+                            .font(font)
+                            .foregroundColor(color)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
                 }
-            }
-            .offset(x: -offset)
-            .frame(width: cw, alignment: .leading)
-            .mask(
-                LinearGradient(
-                    gradient: Gradient(stops: [
-                        .init(color: needsScroll ? .clear : .black, location: 0),
-                        .init(color: .black, location: 0.05),
-                        .init(color: .black, location: 0.95),
-                        .init(color: needsScroll ? .clear : .black, location: 1)
-                    ]),
-                    startPoint: .leading,
-                    endPoint: .trailing
+                .offset(x: -offset)
+                .frame(width: cw, alignment: .leading)
+                .mask(
+                    LinearGradient(
+                        gradient: Gradient(stops: [
+                            .init(color: needsScroll ? .clear : .black, location: 0),
+                            .init(color: .black, location: 0.05),
+                            .init(color: .black, location: 0.95),
+                            .init(color: needsScroll ? .clear : .black, location: 1)
+                        ]),
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
                 )
-            )
+            }
         }
         .frame(maxWidth: .infinity)
-        .frame(height: 20)
         .onChange(of: isActive)  { handleActive($0) }
         .onChange(of: textWidth) { _ in checkAutoStart() }
         .onChange(of: text)      { _ in resetForNewText() }
@@ -1447,13 +1453,12 @@ struct TerminalStationRow: View {
     private let squishSpring = Animation.interpolatingSpring(stiffness: 600, damping: 40)
 
     var body: some View {
-        HStack(spacing: 0) {
+        HStack(alignment: .firstTextBaseline, spacing: 0) {
             // Chevron — slides in and pushes the text right
             Text(">")
                 .font(terminalFont)
                 .foregroundColor(.white)
                 .opacity(isSelected ? 1 : 0)
-                .offset(y: -1) // Subtly center aligned vertically against text
                 .frame(width: isSelected ? 10 : 0, alignment: .leading)
                 .clipped()
                 .animation(pushSpring, value: isSelected)
@@ -1467,6 +1472,7 @@ struct TerminalStationRow: View {
                 .animation(pushSpring, value: isSelected)
 
             if !metaStr.isEmpty {
+                Spacer().frame(width: 8)
                 MarqueeText(
                     text: metaStr,
                     font: terminalFont,
@@ -1583,8 +1589,17 @@ class LiquidScrollState: ObservableObject {
     /// Scroll to center a given item index in the viewport
     func scrollToIndex(_ index: Int, totalItems: Int) {
         guard totalItems > 0 else { return }
-        let itemY = CGFloat(index) * (estimatedRowHeight + rowSpacing)
-        let desiredOffset = itemY - viewportHeight / 2 + estimatedRowHeight / 2
+        
+        // Calculate the effective row height dynamically from the actual rendered content
+        // This ensures the scroll physics perfectly match the SwiftUI layout
+        let effectiveRowHeight = contentHeight > 0 
+            ? (contentHeight + 4) / CGFloat(totalItems) // +4 accounts for VStack spacing
+            : (estimatedRowHeight + 4)
+            
+        let itemY = CGFloat(index) * effectiveRowHeight
+        let itemCenter = itemY + (effectiveRowHeight - 4) / 2
+        let desiredOffset = itemCenter - viewportHeight / 2
+        
         let clamped = min(max(desiredOffset, 0), maxOffset)
         retarget(clamped)
     }
@@ -1664,66 +1679,82 @@ class LiquidScrollState: ObservableObject {
 
 struct AllStationsStationRow: View {
     let station: RadioStation
-    let isSelected: Bool
-    let isPlaying: Bool
-    let isFavorite: Bool
+    let index: Int
+    @Binding var selectedIndex: Int
+    @ObservedObject var audio: AudioManager
+    var isFavorite: Bool
     let terminalFont: Font
+    var onPlay: (() -> Void)? = nil
 
-    private let cardColor = Color.white
-    private let textColor = Color(red: 0.126, green: 0.126, blue: 0.126) // #202020
-    private let selectSpring = Animation.interpolatingSpring(stiffness: 600, damping: 40)
+    @State private var scale: CGFloat = 1.0
+
+    private var isSelected: Bool { index == selectedIndex }
+    private var isPlaying: Bool {
+        audio.currentStation?.id == station.id && audio.isPlaying
+    }
+
+    private let textColor = Color(red: 0.157, green: 0.157, blue: 0.157) // Dark text for light background
+    private let metaColor = Color(red: 0.55, green: 0.55, blue: 0.55) // Grey text
+    private let pushSpring = Animation.interpolatingSpring(stiffness: 280, damping: 28)
+    private let squishSpring = Animation.interpolatingSpring(stiffness: 600, damping: 40)
 
     var body: some View {
-        HStack(spacing: 5) {
+        HStack(alignment: .firstTextBaseline, spacing: 0) {
+            // Chevron — slides in and pushes the text right
             Text(">")
                 .font(terminalFont)
                 .foregroundColor(textColor)
                 .opacity(isSelected ? 1 : 0)
-                .offset(y: -1)
                 .frame(width: isSelected ? 10 : 0, alignment: .leading)
                 .clipped()
-                .animation(selectSpring, value: isSelected)
+                .animation(pushSpring, value: isSelected)
 
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 3) {
-                    if isFavorite {
-                        FavoriteStarShape()
-                            .fill(textColor)
-                            .frame(width: 10, height: 10)
-                    }
-                    if isPlaying {
-                        PlayTriangle()
-                            .fill(textColor)
-                            .frame(width: 7, height: 8)
-                    }
-                    // Station name — fixed (no scroll)
-                    let metaStr = station.metadataDisplayString
-                    Text(station.name)
-                        .font(terminalFont)
-                        .foregroundColor(textColor)
-                        .lineLimit(1)
-
-                    // Metadata — scrolls to the right in grey
-                    if !metaStr.isEmpty {
-                        MarqueeText(
-                            text: metaStr,
-                            font: terminalFont,
-                            color: Color(red: 0.55, green: 0.55, blue: 0.55),
-                            isActive: isSelected,
-                            speed: 30,
-                            startDelay: 1.0,
-                            cycleDelay: 1.0
-                        )
-                    }
+            // Station name and icons — fixed (no scroll); metadata scrolls to the right
+            HStack(spacing: 4) {
+                if isFavorite {
+                    FavoriteStarShape()
+                        .fill(textColor)
+                        .frame(width: 10, height: 10)
                 }
+                if isPlaying {
+                    PlayTriangle()
+                        .fill(textColor)
+                        .frame(width: 7, height: 8)
+                }
+                
+                Text(station.name)
+                    .font(terminalFont)
+                    .foregroundColor(isPlaying ? Color(red: 0.98, green: 0.25, blue: 0.65) : textColor)
+                    .lineLimit(1)
             }
-            .padding(6)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(cardColor)
-            .cornerRadius(2)
-            .shadow(color: .black.opacity(isSelected ? 0.12 : 0.05), radius: isSelected ? 3 : 1, x: 0, y: isSelected ? 1 : 0)
+            .animation(pushSpring, value: isSelected)
+
+            let metaStr = station.metadataDisplayString
+            if !metaStr.isEmpty {
+                Spacer().frame(width: 8)
+                MarqueeText(
+                    text: metaStr,
+                    font: terminalFont,
+                    color: metaColor,
+                    isActive: isSelected,
+                    speed: 30,
+                    startDelay: 1.0,
+                    cycleDelay: 1.0
+                )
+                .animation(pushSpring, value: isSelected)
+            }
         }
-        .animation(selectSpring, value: isSelected)
+        .scaleEffect(scale, anchor: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            scale = 0.97
+            selectedIndex = index
+            audio.playStation(station)
+            onPlay?()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) {
+                withAnimation(squishSpring) { scale = 1.0 }
+            }
+        }
     }
 }
 
@@ -1734,7 +1765,7 @@ struct AllStationsView: View {
     @ObservedObject var audio: AudioManager
     let terminalFont: Font
 
-    private let bgColor = Color(red: 0.941, green: 0.941, blue: 0.941) // #f0f0f0
+    private let bgColor = Color(red: 0.961, green: 0.961, blue: 0.961) // #f5f5f5
     private let textColor = Color(red: 0.157, green: 0.157, blue: 0.157) // #282828
     // Spatial Shift: 300ms Out-Quart
     private let searchSpring = Animation.timingCurve(0.15, 0, 0, 1, duration: 0.3)
@@ -1794,29 +1825,32 @@ struct AllStationsView: View {
     }
 
     private var searchBar: some View {
-        HStack(spacing: 4) {
-            Text(state.searchText.isEmpty ? "Search" : state.searchText)
-                .font(terminalFont)
-                .foregroundColor(textColor.opacity(state.searchText.isEmpty ? 0.5 : 1.0))
-                .lineLimit(1)
+        HStack(spacing: 2) {
+            if !state.searchText.isEmpty {
+                Text(state.searchText)
+                    .font(terminalFont)
+                    .foregroundColor(textColor)
+                    .lineLimit(1)
+            }
             
-            // Blinking Block Cursor
+            // Blinking Line Cursor (Figma 1294:2686 & UX Audit 5B)
             Rectangle()
-                .fill(textColor.opacity(0.8))
-                .frame(width: 6, height: 12)
+                .fill(textColor)
+                .frame(width: 1, height: 10)
                 .opacity(cursorVisible ? 1 : 0)
                 .onAppear {
-                    withAnimation(Animation.easeInOut(duration: 0.4).repeatForever(autoreverses: true)) {
+                    withAnimation(Animation.linear(duration: 0.5).repeatForever(autoreverses: true)) {
                         cursorVisible = false
                     }
                 }
+            
+            if state.searchText.isEmpty {
+                Text("Search")
+                    .font(terminalFont)
+                    .foregroundColor(textColor.opacity(0.5))
+                    .lineLimit(1)
+            }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 3)
-                .fill(textColor.opacity(0.06))
-        )
     }
 
     private var genreBar: some View {
@@ -1868,20 +1902,17 @@ struct AllStationsView: View {
             let viewportH = outerGeo.size.height
 
             // Custom spring-driven scroll — no ScrollView, the VStack moves via offset
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(state.filteredStations.enumerated()), id: \.element.id) { idx, station in
                     AllStationsStationRow(
                         station: station,
-                        isSelected: idx == state.selectedStationIndex,
-                        isPlaying: audio.currentStation?.id == station.id && audio.isPlaying,
+                        index: idx,
+                        selectedIndex: $state.selectedStationIndex,
+                        audio: audio,
                         isFavorite: state.localFavorites.contains(station.id),
-                        terminalFont: terminalFont
+                        terminalFont: terminalFont,
+                        onPlay: { state.addRecent(station) }
                     )
-                    .onTapGesture {
-                        state.selectedStationIndex = idx
-                        audio.playStation(station)
-                        state.addRecent(station)
-                    }
                 }
             }
             .background(
@@ -1938,7 +1969,7 @@ struct ContentView: View {
     @State private var showAllStations: Bool = false
     @State private var showRecents: Bool = false
     @StateObject private var recentsScroll = LiquidScrollState()
-
+    @StateObject private var favoritesScroll = LiquidScrollState()
 
     private let debugPanel = DebugPanelController()
     private let frameTimer = Timer.publish(every: 1.0 / 120.0, on: .main, in: .common).autoconnect()
@@ -1956,27 +1987,35 @@ struct ContentView: View {
     private static let widgetCornerRadius: CGFloat = 12
 
     var body: some View {
-        HStack(spacing: 6) {
-            // ─── NOW PLAYING + FAVORITES (always visible) ───
-            VStack(spacing: 4) {
-                nowPlayingSection
-                favoritesSection
-            }
-            .padding(4)
-            .frame(width: Self.widgetWidth, height: Self.widgetHeight)
-            .background(outerBG)
-            .clipShape(RoundedRectangle(cornerRadius: Self.widgetCornerRadius, style: .continuous))
-            .shadow(color: .black.opacity(0.25), radius: 16, x: 0, y: 8)
+        // ─── Single-widget layout: Now Playing header always on top,
+        //     content area cross-fades between visualizer+favorites and All Stations ───
+        VStack(spacing: 4) {
+            // Now Playing header — always visible at top
+            nowPlayingHeader
 
-            // ─── ALL STATIONS (slides in to the right) ───
-            if showAllStations {
-                AllStationsView(state: allStationsState, audio: audio, terminalFont: terminalFont)
-                    .frame(width: Self.widgetWidth, height: Self.widgetHeight)
-                    .clipShape(RoundedRectangle(cornerRadius: Self.widgetCornerRadius, style: .continuous))
-                    .shadow(color: .black.opacity(0.25), radius: 16, x: 0, y: 8)
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
+            // Content area — in-place cross-fade (Liquid Glass §3 Portals)
+            ZStack {
+                // ─── Default: Visualizer + Favorites ───
+                if !showAllStations {
+                    VStack(spacing: 4) {
+                        visualizerSection
+                        favoritesSection
+                    }
+                    .transition(.opacity)
+                }
+
+                // ─── All Stations: replaces visualizer + favorites ───
+                if showAllStations {
+                    AllStationsView(state: allStationsState, audio: audio, terminalFont: terminalFont)
+                        .transition(.opacity)
+                }
             }
         }
+        .padding(4)
+        .frame(width: Self.widgetWidth, height: Self.widgetHeight)
+        .background(outerBG)
+        .clipShape(RoundedRectangle(cornerRadius: Self.widgetCornerRadius, style: .continuous))
+        .shadow(color: .black.opacity(0.25), radius: 16, x: 0, y: 8)
         .animation(portalCurve, value: showAllStations)
         .fixedSize()
         .onReceive(frameTimer) { _ in
@@ -1991,40 +2030,73 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Now Playing Section
+    // MARK: - Now Playing Header (always visible at top — matches Figma 1294:2362 / 1294:2429 TOP)
 
-    private var nowPlayingSection: some View {
+    private var nowPlayingHeader: some View {
         VStack(spacing: 8) {
-            // Header
-            HStack(spacing: 4) {
-                let isActive = audio.isPlaying && !audio.isPaused
-                let nameText = isActive ? (audio.currentStation?.name ?? "Playing") : "Not Playing"
-                let metaText = isActive ? (audio.currentStation?.metadataDisplayString ?? "") : ""
-
-                Text(nameText)
+            // "Now Playing" label
+            HStack {
+                Text("Now Playing")
                     .font(terminalFont)
                     .foregroundColor(.white)
-                    .lineLimit(1)
-
-                if !metaText.isEmpty {
-                    MarqueeText(
-                        text: metaText,
-                        font: terminalFont,
-                        color: Color.white.opacity(0.4),
-                        isActive: isActive,
-                        speed: 30,
-                        startDelay: 10.0,
-                        cycleDelay: 10.0
-                    )
-                }
+                Spacer()
             }
 
             ThinDivider()
 
-            // Visualizer area
+            // Station name (or "Not Playing")
+            HStack(spacing: 4) {
+                let isActive = audio.isPlaying && !audio.isPaused
+                let nameText = isActive ? (audio.currentStation?.name ?? "Playing") : "Not Playing"
+
+                MarqueeText(
+                    text: nameText,
+                    font: terminalFont,
+                    color: .white,
+                    isActive: isActive,
+                    speed: 30,
+                    startDelay: 10.0,
+                    cycleDelay: 10.0
+                )
+            }
+
+            ThinDivider()
+
+            // << ■ >> transport controls (Figma: 1294:2372)
+            HStack {
+                Text("<<")
+                    .font(terminalFont)
+                    .foregroundColor(.white)
+                    .contentShape(Rectangle())
+                    .onTapGesture { sweepStation(direction: -1) }
+                Spacer()
+                // Stop square (Figma: 1294:2427 — 11×11 stroked white)
+                Rectangle()
+                    .stroke(Color.white, lineWidth: 0.5)
+                    .frame(width: 11, height: 11)
+                    .contentShape(Rectangle())
+                    .onTapGesture { audio.togglePause() }
+                Spacer()
+                Text(">>")
+                    .font(terminalFont)
+                    .foregroundColor(.white)
+                    .contentShape(Rectangle())
+                    .onTapGesture { sweepStation(direction: 1) }
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.top, 8)
+        .padding(.bottom, 6)
+        .background(panelBG)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    // MARK: - Visualizer Section (fades out when switching to All Stations)
+
+    private var visualizerSection: some View {
+        VStack(spacing: 0) {
             GeometryReader { geo in
                 ZStack {
-                    // Visualizer dots — animate geometry changes for smooth preset transitions
                     let presetSpring = Animation.interpolatingSpring(stiffness: 100, damping: 20)
                     HStack(spacing: settings.spacing) {
                         ForEach(0..<6, id: \.self) { i in
@@ -2041,23 +2113,9 @@ struct ContentView: View {
                 .frame(width: geo.size.width, height: geo.size.height)
             }
             .frame(height: 180)
-
-            ThinDivider()
-
-            // << and >> navigation
-            HStack {
-                Text("<<")
-                    .font(terminalFont)
-                    .foregroundColor(.white)
-                Spacer()
-                Text(">>")
-                    .font(terminalFont)
-                    .foregroundColor(.white)
-            }
         }
         .padding(.horizontal, 6)
-        .padding(.top, 8)
-        .padding(.bottom, 6)
+        .padding(.vertical, 8)
         .background(panelBG)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
@@ -2068,7 +2126,7 @@ struct ContentView: View {
         let pushSpring = Animation.interpolatingSpring(stiffness: 280, damping: 28)
         return VStack(spacing: 8) {
             // Header — left/right arrows indicate toggling is available
-            HStack {
+            HStack(alignment: .firstTextBaseline) {
                 Text("<")
                     .font(terminalFont)
                     .foregroundColor(.white.opacity(showRecents ? 1.0 : 0.25))
@@ -2088,8 +2146,12 @@ struct ContentView: View {
             if showRecents {
                 recentsContent
             } else {
-                favoritesContent(pushSpring: pushSpring)
+                favoritesContent()
             }
+
+            ThinDivider()
+
+            allStationsLink(pushSpring: pushSpring)
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 8)
@@ -2098,35 +2160,76 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private func favoritesContent(pushSpring: Animation) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(Array(allStationsState.favoriteStations.enumerated()), id: \.element.id) { idx, station in
-                TerminalStationRow(
-                    station: station,
-                    index: idx,
-                    selectedIndex: $selectedIndex,
-                    audio: audio,
-                    terminalFont: terminalFont,
-                    onPlay: { allStationsState.addRecent(station) }
-                )
+    private func favoritesContent() -> some View {
+        if allStationsState.favoriteStations.isEmpty {
+            VStack {
+                Spacer()
+                Text("No favorite stations")
+                    .font(terminalFont)
+                    .foregroundColor(.white.opacity(0.4))
+                Spacer()
             }
+            .frame(height: 96)
+        } else {
+            GeometryReader { outerGeo in
+                let viewportH = outerGeo.size.height
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(allStationsState.favoriteStations.enumerated()), id: \.element.id) { idx, station in
+                        TerminalStationRow(
+                            station: station,
+                            index: idx,
+                            selectedIndex: $selectedIndex,
+                            audio: audio,
+                            terminalFont: terminalFont,
+                            onPlay: { allStationsState.addRecent(station) }
+                        )
+                    }
+                }
+                .background(
+                    GeometryReader { contentGeo in
+                        Color.clear
+                            .onAppear {
+                                favoritesScroll.updateGeometry(contentHeight: contentGeo.size.height, viewportHeight: viewportH)
+                            }
+                            .onChange(of: contentGeo.size.height) { h in
+                                favoritesScroll.updateGeometry(contentHeight: h, viewportHeight: viewportH)
+                            }
+                    }
+                )
+                .offset(y: -favoritesScroll.offset)
+                .frame(width: outerGeo.size.width, height: viewportH, alignment: .topLeading)
+                .clipped()
+                .onChange(of: selectedIndex) { newIdx in
+                    favoritesScroll.scrollToIndex(newIdx, totalItems: allStationsState.favoriteStations.count)
+                }
+                .onChange(of: allStationsState.favoriteStations.count) { _ in
+                    favoritesScroll.jumpToTop()
+                }
+                .onAppear {
+                    favoritesScroll.updateGeometry(contentHeight: favoritesScroll.contentHeight, viewportHeight: viewportH)
+                }
+            }
+            .frame(height: 96)
         }
+    }
 
-        ThinDivider()
+    private func allStationsLink(pushSpring: Animation) -> some View {
+        let listCount = showRecents ? allStationsState.recentStations.count : allStationsState.favoriteStations.count
+        let isSelected = selectedIndex == listCount
 
-        // All Stations entry point (keyboard navigable)
-        HStack(spacing: 0) {
+        return HStack(spacing: 0) {
             Text(">")
                 .font(terminalFont)
                 .foregroundColor(.white)
-                .opacity(selectedIndex == allStationsState.favoriteStations.count ? 1 : 0)
-                .frame(width: selectedIndex == allStationsState.favoriteStations.count ? 10 : 0, alignment: .leading)
+                .opacity(isSelected ? 1 : 0)
+                .frame(width: isSelected ? 10 : 0, alignment: .leading)
                 .clipped()
-                .animation(pushSpring, value: selectedIndex == allStationsState.favoriteStations.count)
+                .animation(pushSpring, value: isSelected)
             Text("All Stations")
                 .font(terminalFont)
                 .foregroundColor(.white)
-                .animation(pushSpring, value: selectedIndex == allStationsState.favoriteStations.count)
+                .animation(pushSpring, value: isSelected)
+            Spacer()
         }
         .contentShape(Rectangle())
         .onTapGesture {
@@ -2137,11 +2240,14 @@ struct ContentView: View {
     @ViewBuilder
     private var recentsContent: some View {
         if allStationsState.recentStations.isEmpty {
-            Spacer()
-            Text("No recent stations")
-                .font(terminalFont)
-                .foregroundColor(.white.opacity(0.4))
-            Spacer()
+            VStack {
+                Spacer()
+                Text("No recent stations")
+                    .font(terminalFont)
+                    .foregroundColor(.white.opacity(0.4))
+                Spacer()
+            }
+            .frame(height: 96)
         } else {
             GeometryReader { outerGeo in
                 let viewportH = outerGeo.size.height
@@ -2193,6 +2299,7 @@ struct ContentView: View {
                     )
                 }
             }
+            .frame(height: 96)
         }
     }
 
@@ -2219,7 +2326,7 @@ struct ContentView: View {
 
             case 125: // Down arrow
                 if showRecents {
-                    if selectedIndex < allStationsState.recentStations.count - 1 {
+                    if selectedIndex < allStationsState.recentStations.count {
                         selectedIndex += 1
                     }
                 } else {
@@ -2231,6 +2338,10 @@ struct ContentView: View {
 
             case 36: // Enter / Return
                 if showRecents {
+                    if selectedIndex == allStationsState.recentStations.count {
+                        enterAllStations()
+                        return true
+                    }
                     if selectedIndex < allStationsState.recentStations.count {
                         let s = allStationsState.recentStations[selectedIndex]
                         audio.playStation(s)
@@ -2415,8 +2526,12 @@ struct ContentView: View {
         withAnimation(portalCurve) {
             showAllStations = false
         }
-        allStationsState.reset()
-        selectedIndex = allStationsState.favoriteStations.count
+        // UX Audit 5C: Delay reset so the panel animates out with content intact
+        let favCount = allStationsState.favoriteStations.count
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            allStationsState.reset()
+        }
+        selectedIndex = favCount
     }
 
     private func sweepStation(direction: Int) {
