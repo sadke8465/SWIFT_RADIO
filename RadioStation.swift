@@ -2067,6 +2067,7 @@ struct ContentView: View {
                         visualizerSection
                         favoritesSection
                     }
+                    .frame(maxHeight: .infinity)
                     .transition(.opacity)
                 }
 
@@ -2076,6 +2077,7 @@ struct ContentView: View {
                         .transition(.opacity)
                 }
             }
+            .frame(maxHeight: .infinity)
         }
         .padding(4)
         .frame(width: Self.widgetWidth, height: Self.widgetHeight)
@@ -2099,7 +2101,7 @@ struct ContentView: View {
     // MARK: - Now Playing Header (always visible at top — matches Figma 1294:2362 / 1294:2429 TOP)
 
     private var nowPlayingHeader: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 0) {
             // "Now Playing" label
             HStack {
                 Text("Now Playing")
@@ -2107,6 +2109,7 @@ struct ContentView: View {
                     .foregroundColor(.white)
                 Spacer()
             }
+            .padding(.bottom, 6)
 
             ThinDivider()
 
@@ -2125,6 +2128,7 @@ struct ContentView: View {
                     cycleDelay: 10.0
                 )
             }
+            .padding(.vertical, 6)
 
             ThinDivider()
 
@@ -2149,6 +2153,7 @@ struct ContentView: View {
                     .contentShape(Rectangle())
                     .onTapGesture { sweepStation(direction: 1) }
             }
+            .padding(.top, 6)
         }
         .padding(.horizontal, 6)
         .padding(.top, 8)
@@ -2178,7 +2183,7 @@ struct ContentView: View {
                 }
                 .frame(width: geo.size.width, height: geo.size.height)
             }
-            .frame(height: 180)
+            .frame(maxHeight: .infinity)
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 8)
