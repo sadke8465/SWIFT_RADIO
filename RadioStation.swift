@@ -1586,22 +1586,44 @@ class LiquidScrollState: ObservableObject {
         self.viewportHeight = viewportHeight
     }
 
-    /// Scroll to center a given item index in the viewport
+    /// Scroll so the selected item is fully visible, snapping to exact item boundaries.
+    /// The offset is always a multiple of slotHeight so no item is ever clipped.
+    /// Navigation moves the viewport by exactly one item height at a time.
     func scrollToIndex(_ index: Int, totalItems: Int) {
         guard totalItems > 0 else { return }
-        
-        // Calculate the effective row height dynamically from the actual rendered content
-        // This ensures the scroll physics perfectly match the SwiftUI layout
-        let effectiveRowHeight = contentHeight > 0 
-            ? (contentHeight + 4) / CGFloat(totalItems) // +4 accounts for VStack spacing
-            : (estimatedRowHeight + 4)
-            
-        let itemY = CGFloat(index) * effectiveRowHeight
-        let itemCenter = itemY + (effectiveRowHeight - 4) / 2
-        let desiredOffset = itemCenter - viewportHeight / 2
-        
-        let clamped = min(max(desiredOffset, 0), maxOffset)
-        retarget(clamped)
+
+        // slotHeight = rowHeight + spacing (VStack uses spacing: 4)
+        // contentHeight = totalItems * rowHeight + (totalItems - 1) * 4
+        //               = totalItems * slotHeight - 4
+        // => slotHeight = (contentHeight + 4) / totalItems
+        let spacing: CGFloat = 4
+        let slotHeight: CGFloat = contentHeight > 0
+            ? (contentHeight + spacing) / CGFloat(totalItems)
+            : estimatedRowHeight + spacing
+
+        // How many complete items fit in the viewport
+        let visibleCount = max(1, Int((viewportHeight + spacing) / slotHeight))
+
+        // Which item is currently the first visible one (targetOffset is always a
+        // multiple of slotHeight, so this division is exact after the first scroll)
+        let currentFirstVisible = Int(targetOffset / slotHeight)
+
+        var newFirstVisible = currentFirstVisible
+        if index < currentFirstVisible {
+            // Selected item is above the visible window — scroll up
+            newFirstVisible = index
+        } else if index >= currentFirstVisible + visibleCount {
+            // Selected item is below the visible window — scroll down
+            newFirstVisible = index - visibleCount + 1
+        } else {
+            return // Already fully visible; no scroll needed
+        }
+
+        let maxFirstVisible = max(0, totalItems - visibleCount)
+        newFirstVisible = max(0, min(newFirstVisible, maxFirstVisible))
+
+        let newOffset = min(CGFloat(newFirstVisible) * slotHeight, maxOffset)
+        retarget(newOffset)
     }
 
     /// Instantly jump to offset (no animation) — for genre switches
