@@ -633,6 +633,27 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        let dest = request.url?.absoluteString ?? "?"
+        print("[STREAM] Redirect → \(dest)")
+        // Reject redirects to localhost — the stream is offline or geo-blocked
+        if let host = request.url?.host, host == "127.0.0.1" || host == "localhost" {
+            print("[STREAM] ERROR: Redirect to localhost blocked — stream is offline or geo-restricted")
+            completionHandler(nil)
+            DispatchQueue.main.async {
+                self.onError?("Stream unavailable — the station may be offline or geo-restricted.")
+            }
+            return
+        }
+        completionHandler(request)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
         if let e = error as NSError? {
@@ -643,10 +664,16 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
                 print("[STREAM] ERROR: Stream failed for \(url)")
                 print("[STREAM]   → \(e.localizedDescription)")
                 print("[STREAM]   → domain=\(e.domain) code=\(e.code)")
+                let msg: String
                 if e.domain == NSURLErrorDomain && e.code == NSURLErrorAppTransportSecurityRequiresSecureConnection {
                     print("[STREAM]   → ATS BLOCKED: This is an HTTP (non-HTTPS) stream. Add NSAllowsArbitraryLoads to Info.plist to allow plain HTTP streams.")
+                    msg = e.localizedDescription
+                } else if e.domain == NSURLErrorDomain && e.code == NSURLErrorCannotConnectToHost {
+                    print("[STREAM]   → Connection refused — stream is offline or geo-restricted")
+                    msg = "Stream unavailable — the station may be offline or geo-restricted."
+                } else {
+                    msg = e.localizedDescription
                 }
-                let msg = e.localizedDescription
                 DispatchQueue.main.async { self.onError?(msg) }
             }
         } else {
@@ -905,6 +932,7 @@ class AudioManager: NSObject, ObservableObject {
     @Published var streamError: String?
 
     private let streamEngine = StreamAudioEngine()
+    private var triedFallbackURL = false
 
     private var fileEngine = AVAudioEngine()
     private var filePlayer = AVAudioPlayerNode()
@@ -921,7 +949,21 @@ class AudioManager: NSObject, ObservableObject {
             DispatchQueue.main.async { self?.amplitudes = bands }
         }
         streamEngine.onError = { [weak self] message in
-            DispatchQueue.main.async { self?.streamError = message }
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                // If url_resolved failed and the raw url differs, try it once as a fallback
+                if let station = self.currentStation,
+                   !self.triedFallbackURL,
+                   station.urlResolved != station.url,
+                   !station.url.isEmpty,
+                   let fallbackURL = URL(string: station.url) {
+                    self.triedFallbackURL = true
+                    print("[PLAY] url_resolved failed — retrying with raw url: \(station.url)")
+                    self.streamEngine.play(url: fallbackURL)
+                } else {
+                    self.streamError = message
+                }
+            }
         }
     }
 
@@ -933,6 +975,7 @@ class AudioManager: NSObject, ObservableObject {
 
     func playStation(_ station: RadioStation) {
         stopFilePlayback()
+        triedFallbackURL = false
         let urlString = station.streamURL
         guard let url = URL(string: urlString) else {
             print("[PLAY] Invalid URL for '\(station.name)': \(urlString)")
