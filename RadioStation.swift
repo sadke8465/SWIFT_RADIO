@@ -16,6 +16,9 @@ struct RadioStation: Identifiable, Codable {
     let id: String
     let name: String
     let url: String
+    /// Resolved direct stream URL from Radio Browser API (follows redirects).
+    /// Prefer this over `url` which may point to a playlist or redirect page.
+    let urlResolved: String
     let favicon: String
     let tags: String
     let country: String
@@ -26,19 +29,28 @@ struct RadioStation: Identifiable, Codable {
     enum CodingKeys: String, CodingKey {
         case id = "stationuuid"
         case name, url, favicon, tags, country, codec, bitrate, votes
+        case urlResolved = "url_resolved"
     }
 
     /// Manual init for hardcoded favorites
-    init(id: String, name: String, url: String, favicon: String = "", tags: String = "", country: String = "", codec: String = "MP3", bitrate: Int = 128, votes: Int = 0) {
+    init(id: String, name: String, url: String, urlResolved: String = "", favicon: String = "", tags: String = "", country: String = "", codec: String = "MP3", bitrate: Int = 128, votes: Int = 0) {
         self.id = id
         self.name = name
         self.url = url
+        self.urlResolved = urlResolved
         self.favicon = favicon
         self.tags = tags
         self.country = country
         self.codec = codec
         self.bitrate = bitrate
         self.votes = votes
+    }
+
+    /// Best stream URL to use for playback.
+    /// Prefers `url_resolved` (direct stream) over `url` (may be playlist/redirect).
+    var streamURL: String {
+        let resolved = urlResolved.trimmingCharacters(in: .whitespaces)
+        return resolved.isEmpty ? url : resolved
     }
 }
 
@@ -257,13 +269,25 @@ class AllStationsState: ObservableObject {
             let enc = tag.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? tag
             urlStr += "&tag=\(enc)"
         }
-        guard let url = URL(string: urlStr) else { return [] }
+        guard let url = URL(string: urlStr) else {
+            print("[API] Invalid URL: \(urlStr)")
+            return []
+        }
         var req = URLRequest(url: url)
         req.setValue("RadioVisualizerApp/1.0", forHTTPHeaderField: "User-Agent")
         do {
-            let (data, _) = try await URLSession.shared.data(for: req)
-            return try JSONDecoder().decode([RadioStation].self, from: data)
-        } catch { return [] }
+            let (data, response) = try await URLSession.shared.data(for: req)
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                print("[API] HTTP \(http.statusCode) for \(urlStr)")
+                return []
+            }
+            let stations = try JSONDecoder().decode([RadioStation].self, from: data)
+            print("[API] Fetched \(stations.count) stations (country=\(country) tag=\(tag ?? "none"))")
+            return stations
+        } catch {
+            print("[API] Fetch failed (country=\(country) tag=\(tag ?? "none")): \(error.localizedDescription)")
+            return []
+        }
     }
 
     private func deduplicate(_ stations: [RadioStation], limit: Int) -> [RadioStation] {
@@ -438,6 +462,8 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
     private let fftLog2n : vDSP_Length
     private let fftSetup : FFTSetup
     var onAmplitudes: (([Float]) -> Void)?
+    /// Called on the main thread when a stream error occurs (not on deliberate stop/cancel).
+    var onError: ((String) -> Void)?
 
     override init() {
         fftLog2n = vDSP_Length(log2(Double(1024)))
@@ -462,6 +488,8 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
     private var fftLastLogTime = Date()
     private var decodeCallCount = 0
     private var decodeLastLogTime = Date()
+    /// Tracks whether we've received the first data chunk from the current stream
+    private var firstDataReceived = false
 
     private func buildEngine() {
         engine.attach(playerNode)
@@ -483,9 +511,11 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
     }
 
     func play(url: URL) {
+        print("[STREAM] play() → \(url.absoluteString)")
         stopStream()  // increments generation, cancels session, drains queue
         prebufferDone = false
         bytesBuffered = 0
+        firstDataReceived = false
 
         // Record the generation for this stream BEFORE opening.
         // onProperty/onPackets check self.activeGeneration — no capture needed.
@@ -504,15 +534,17 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
 
         let st = AudioFileStreamOpen(ptr, propCB, pktCB, 0, &fileStream)
         guard st == noErr else {
-            print("AudioFileStreamOpen failed: \(st)")
+            print("[STREAM] ERROR: AudioFileStreamOpen failed with OSStatus \(st)")
             return
         }
+        print("[STREAM] AudioFileStreamOpen OK (gen=\(generation))")
 
         var cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 30
         session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
         task    = session?.dataTask(with: url)
         task?.resume()
+        print("[STREAM] URLSession task started")
     }
 
     func stopStream() {
@@ -553,8 +585,44 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
     func urlSession(
         _ session: URLSession,
         dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let http = response as? HTTPURLResponse else {
+            print("[STREAM] Non-HTTP response — allowing data through")
+            completionHandler(.allow)
+            return
+        }
+
+        let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? "unknown"
+        print("[STREAM] HTTP \(http.statusCode) | Content-Type: \(contentType) | URL: \(http.url?.absoluteString ?? "?")")
+
+        if http.statusCode >= 400 {
+            let msg = "Station unreachable (HTTP \(http.statusCode))"
+            print("[STREAM] ERROR: \(msg)")
+            completionHandler(.cancel)
+            DispatchQueue.main.async { self.onError?(msg) }
+            return
+        }
+
+        // Warn if the server is returning a playlist instead of raw audio
+        let lct = contentType.lowercased()
+        if lct.contains("mpegurl") || lct.contains("x-scpls") || lct.contains("x-pls") || lct.contains("playlist") {
+            print("[STREAM] WARNING: Content-Type '\(contentType)' looks like a playlist file, not a raw audio stream. The station URL likely needs to be the direct stream URL.")
+        }
+
+        completionHandler(.allow)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
         didReceive data: Data
     ) {
+        if !firstDataReceived {
+            firstDataReceived = true
+            print("[STREAM] First data chunk received (\(data.count) bytes)")
+        }
         guard let stream = fileStream else { return }
         data.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
@@ -567,8 +635,22 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
         task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
-        if let e = error as NSError?, e.code != NSURLErrorCancelled {
-            print("Stream error: \(e.localizedDescription)")
+        if let e = error as NSError? {
+            if e.code == NSURLErrorCancelled {
+                print("[STREAM] Stream cancelled (expected on stop/switch)")
+            } else {
+                let url = task.originalRequest?.url?.absoluteString ?? "unknown URL"
+                print("[STREAM] ERROR: Stream failed for \(url)")
+                print("[STREAM]   → \(e.localizedDescription)")
+                print("[STREAM]   → domain=\(e.domain) code=\(e.code)")
+                if e.domain == NSURLErrorDomain && e.code == NSURLErrorAppTransportSecurityRequiresSecureConnection {
+                    print("[STREAM]   → ATS BLOCKED: This is an HTTP (non-HTTPS) stream. Add NSAllowsArbitraryLoads to Info.plist to allow plain HTTP streams.")
+                }
+                let msg = e.localizedDescription
+                DispatchQueue.main.async { self.onError?(msg) }
+            }
+        } else {
+            print("[STREAM] Stream ended (server closed connection — normal for some stations)")
         }
     }
 
@@ -578,11 +660,25 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
         case kAudioFileStreamProperty_DataFormat:
             var sz   = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
             var asbd = AudioStreamBasicDescription()
-            guard AudioFileStreamGetProperty(stream, id, &sz, &asbd) == noErr else { return }
+            guard AudioFileStreamGetProperty(stream, id, &sz, &asbd) == noErr else {
+                print("[STREAM] ERROR: Failed to read DataFormat property")
+                return
+            }
             var mAsbd = asbd
             sourceFormat = AVAudioFormat(streamDescription: &mAsbd)
             if let src = sourceFormat {
                 converter = AVAudioConverter(from: src, to: destFormat)
+                let sr = src.sampleRate
+                let ch = src.channelCount
+                let fmt = src.streamDescription.pointee
+                print("[STREAM] Audio format detected: \(Int(sr)) Hz, \(ch) ch, formatID=\(String(format: "%c%c%c%c", (fmt.mFormatID >> 24) & 0xFF, (fmt.mFormatID >> 16) & 0xFF, (fmt.mFormatID >> 8) & 0xFF, fmt.mFormatID & 0xFF))")
+                if converter == nil {
+                    print("[STREAM] ERROR: AVAudioConverter creation failed — format may be unsupported")
+                } else {
+                    print("[STREAM] AVAudioConverter ready")
+                }
+            } else {
+                print("[STREAM] ERROR: Could not create AVAudioFormat from stream descriptor")
             }
 
         case kAudioFileStreamProperty_PacketSizeUpperBound,
@@ -590,7 +686,10 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
             var sz  = UInt32(MemoryLayout<UInt32>.size)
             var val = UInt32(0)
             AudioFileStreamGetProperty(stream, id, &sz, &val)
-            if val > 0 { maxPktSize = Int(val) }
+            if val > 0 {
+                maxPktSize = Int(val)
+                print("[STREAM] Max packet size: \(val) bytes")
+            }
 
         default:
             break
@@ -632,6 +731,7 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
 
         if !prebufferDone && total >= prebuffer {
             prebufferDone = true
+            print("[STREAM] Prebuffer satisfied (\(total) bytes) — starting decode/playback")
             let gen = generation
             decodeQueue.async { [weak self] in
                 guard let self, self.generation == gen else { return }
@@ -697,7 +797,13 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
 
         var error: NSError?
         let result = conv.convert(to: out, error: &error, withInputFrom: inputBlock)
-        if result != .error && out.frameLength > 0 {
+        if result == .error || out.frameLength == 0 {
+            if let e = error {
+                print("[STREAM] Decode error: \(e.localizedDescription) (domain=\(e.domain) code=\(e.code))")
+            } else if out.frameLength == 0 {
+                print("[STREAM] Decode produced 0 frames (no audio output for this batch)")
+            }
+        } else {
             playerNode.scheduleBuffer(out)
 
             // Debug: log decode cadence
@@ -706,7 +812,7 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
                 let now = Date()
                 let dt = now.timeIntervalSince(decodeLastLogTime)
                 if dt >= 1.0 {
-                    print("DECODE: \(decodeCallCount) calls/s, batch=\(batch.count) pkts, frames=\(out.frameLength)")
+                    print("[DECODE] \(decodeCallCount) calls/s, batch=\(batch.count) pkts, frames=\(out.frameLength)")
                     decodeCallCount = 0
                     decodeLastLogTime = now
                 }
@@ -776,7 +882,7 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
             if dt >= 2.0 {
                 let rate = Double(fftCallCount) / dt
                 let bandStr = bands.map { String(format: "%.1f", $0) }.joined(separator: ", ")
-                print("FFT: \(String(format: "%.0f", rate)) Hz  bands: [\(bandStr)]")
+                print("[FFT] \(String(format: "%.0f", rate)) Hz  bands: [\(bandStr)]")
                 fftCallCount = 0
                 fftLastLogTime = now
             }
@@ -795,6 +901,8 @@ class AudioManager: NSObject, ObservableObject {
     @Published var isPaused                 = false
     @Published var currentStation: RadioStation?
     @Published var fileName: String         = "No file selected"
+    /// Non-nil when the current stream hit a connection/playback error.
+    @Published var streamError: String?
 
     private let streamEngine = StreamAudioEngine()
 
@@ -812,6 +920,9 @@ class AudioManager: NSObject, ObservableObject {
         streamEngine.onAmplitudes = { [weak self] bands in
             DispatchQueue.main.async { self?.amplitudes = bands }
         }
+        streamEngine.onError = { [weak self] message in
+            DispatchQueue.main.async { self?.streamError = message }
+        }
     }
 
     deinit {
@@ -822,14 +933,22 @@ class AudioManager: NSObject, ObservableObject {
 
     func playStation(_ station: RadioStation) {
         stopFilePlayback()
-        guard let url = URL(string: station.url) else {
+        let urlString = station.streamURL
+        guard let url = URL(string: urlString) else {
+            print("[PLAY] Invalid URL for '\(station.name)': \(urlString)")
             DispatchQueue.main.async { self.fileName = "Invalid URL" }
             return
+        }
+        print("[PLAY] '\(station.name)' | codec=\(station.codec) bitrate=\(station.bitrate)k")
+        print("[PLAY] stream URL: \(urlString)")
+        if station.url != urlString {
+            print("[PLAY] (raw url was: \(station.url))")
         }
         streamEngine.play(url: url)
         DispatchQueue.main.async {
             self.isPlaying      = true
             self.isPaused       = false
+            self.streamError    = nil   // clear previous error
             self.currentStation = station
             self.fileName       = station.name
         }
@@ -839,7 +958,7 @@ class AudioManager: NSObject, ObservableObject {
         guard isPlaying else { return }
         if isPaused {
             // Resume — replay current station
-            if let station = currentStation, let url = URL(string: station.url) {
+            if let station = currentStation, let url = URL(string: station.streamURL) {
                 streamEngine.play(url: url)
             }
             DispatchQueue.main.async {
@@ -2128,12 +2247,17 @@ struct ContentView: View {
                     .onTapGesture { sweepStation(direction: -1) }
 
                 let isActive = audio.isPlaying && !audio.isPaused
-                let nameText = isActive ? (audio.currentStation?.name ?? "Playing") : "Not Playing"
+                let nameText: String = {
+                    if let err = audio.streamError { return "⚠ \(err)" }
+                    if isActive { return audio.currentStation?.name ?? "Playing" }
+                    return "Not Playing"
+                }()
+                let nameColor: Color = audio.streamError != nil ? Color(red: 1.0, green: 0.45, blue: 0.35) : .white
                 MarqueeText(
                     text: nameText,
                     font: terminalFont,
-                    color: .white,
-                    isActive: isActive,
+                    color: nameColor,
+                    isActive: isActive || audio.streamError != nil,
                     speed: 30,
                     startDelay: 10.0,
                     cycleDelay: 10.0
