@@ -2065,7 +2065,9 @@ struct ContentView: View {
                 if !showAllStations {
                     VStack(spacing: 4) {
                         visualizerSection
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                         favoritesSection
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .frame(maxHeight: .infinity)
                     .transition(.opacity)
@@ -2113,11 +2115,17 @@ struct ContentView: View {
 
             ThinDivider()
 
-            // Station name (or "Not Playing")
-            HStack(spacing: 4) {
+            // Station name + << ■ >> transport controls on a single row
+            // (Figma: 1294:2372 / 1294:2427 — stop square 11×11 stroked white)
+            HStack(spacing: 8) {
+                Text("<<")
+                    .font(terminalFont)
+                    .foregroundColor(.white)
+                    .contentShape(Rectangle())
+                    .onTapGesture { sweepStation(direction: -1) }
+
                 let isActive = audio.isPlaying && !audio.isPaused
                 let nameText = isActive ? (audio.currentStation?.name ?? "Playing") : "Not Playing"
-
                 MarqueeText(
                     text: nameText,
                     font: terminalFont,
@@ -2127,35 +2135,23 @@ struct ContentView: View {
                     startDelay: 10.0,
                     cycleDelay: 10.0
                 )
-            }
-            .padding(.top, 4)
-            .padding(.bottom, 2)
 
-            // << ■ >> transport controls (Figma: 1294:2372)
-            HStack {
-                Text("<<")
-                    .font(terminalFont)
-                    .foregroundColor(.white)
-                    .contentShape(Rectangle())
-                    .onTapGesture { sweepStation(direction: -1) }
-                Spacer()
-                // Stop square (Figma: 1294:2427 — 11×11 stroked white)
                 Rectangle()
                     .stroke(Color.white, lineWidth: 0.5)
                     .frame(width: 11, height: 11)
                     .contentShape(Rectangle())
                     .onTapGesture { audio.togglePause() }
-                Spacer()
+
                 Text(">>")
                     .font(terminalFont)
                     .foregroundColor(.white)
                     .contentShape(Rectangle())
                     .onTapGesture { sweepStation(direction: 1) }
             }
+            .padding(.top, 4)
         }
         .padding(.horizontal, 6)
-        .padding(.top, 6)
-        .padding(.bottom, 4)
+        .padding(.vertical, 6)
         .background(panelBG)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
