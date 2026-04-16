@@ -1270,68 +1270,69 @@ struct MarqueeText: View {
     private var scrollDistance: CGFloat { textWidth + spacing }
 
     var body: some View {
-        ZStack(alignment: .leading) {
-            Text(text)
-                .font(font)
-                .lineLimit(1)
-                .hidden()
-                
-            GeometryReader { geo in
-                let cw = geo.size.width
+        // Hidden text anchors the height to a single line; GeometryReader overlay
+        // fills that same height for width measurement without expanding vertically.
+        Text(text)
+            .font(font)
+            .lineLimit(1)
+            .hidden()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(alignment: .leading) {
+                GeometryReader { geo in
+                    let cw = geo.size.width
 
-                HStack(spacing: spacing) {
-                    Text(text)
-                        .font(font)
-                        .foregroundColor(color)
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
-                        .background(
-                            GeometryReader { tp in
-                                Color.clear.onAppear {
-                                    textWidth = tp.size.width
-                                    containerWidth = cw
-                                }
-                                .onChange(of: tp.size.width) { textWidth = $0 }
-                                .onChange(of: cw) { containerWidth = $0 }
-                            }
-                        )
-
-                    if needsScroll {
+                    HStack(spacing: spacing) {
                         Text(text)
                             .font(font)
                             .foregroundColor(color)
                             .lineLimit(1)
                             .fixedSize(horizontal: true, vertical: false)
+                            .background(
+                                GeometryReader { tp in
+                                    Color.clear.onAppear {
+                                        textWidth = tp.size.width
+                                        containerWidth = cw
+                                    }
+                                    .onChange(of: tp.size.width) { textWidth = $0 }
+                                    .onChange(of: cw) { containerWidth = $0 }
+                                }
+                            )
+
+                        if needsScroll {
+                            Text(text)
+                                .font(font)
+                                .foregroundColor(color)
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
                     }
-                }
-                .offset(x: -offset)
-                .frame(width: cw, alignment: .leading)
-                .mask(
-                    LinearGradient(
-                        gradient: Gradient(stops: [
-                            .init(color: needsScroll ? .clear : .black, location: 0),
-                            .init(color: .black, location: 0.05),
-                            .init(color: .black, location: 0.95),
-                            .init(color: needsScroll ? .clear : .black, location: 1)
-                        ]),
-                        startPoint: .leading,
-                        endPoint: .trailing
+                    .offset(x: -offset)
+                    .frame(width: cw, alignment: .leading)
+                    .mask(
+                        LinearGradient(
+                            gradient: Gradient(stops: [
+                                .init(color: needsScroll ? .clear : .black, location: 0),
+                                .init(color: .black, location: 0.05),
+                                .init(color: .black, location: 0.95),
+                                .init(color: needsScroll ? .clear : .black, location: 1)
+                            ]),
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
                     )
-                )
+                }
             }
-        }
-        .frame(maxWidth: .infinity)
-        .onChange(of: isActive)  { handleActive($0) }
-        .onChange(of: textWidth) { _ in checkAutoStart() }
-        .onChange(of: text)      { _ in resetForNewText() }
-        .onAppear {
-            MarqueeDisplayLink.shared.register(id: linkID) { [self] dt in
-                self.tick(dt: dt)
+            .onChange(of: isActive)  { handleActive($0) }
+            .onChange(of: textWidth) { _ in checkAutoStart() }
+            .onChange(of: text)      { _ in resetForNewText() }
+            .onAppear {
+                MarqueeDisplayLink.shared.register(id: linkID) { [self] dt in
+                    self.tick(dt: dt)
+                }
             }
-        }
-        .onDisappear {
-            MarqueeDisplayLink.shared.unregister(id: linkID)
-        }
+            .onDisappear {
+                MarqueeDisplayLink.shared.unregister(id: linkID)
+            }
     }
 
     // ── Frame tick (called ~120 Hz from shared display link) ──
@@ -2056,8 +2057,10 @@ struct ContentView: View {
         // ─── Single-widget layout: Now Playing header always on top,
         //     content area cross-fades between visualizer+favorites and All Stations ───
         VStack(spacing: 4) {
-            // Now Playing header — always visible at top
+            // Now Playing header — always visible at top; fixedSize prevents the
+            // GeometryReader inside MarqueeText from inflating the header's height.
             nowPlayingHeader
+                .fixedSize(horizontal: false, vertical: true)
 
             // Content area — in-place cross-fade (Liquid Glass §3 Portals)
             ZStack {
