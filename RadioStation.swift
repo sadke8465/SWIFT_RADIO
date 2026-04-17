@@ -1000,12 +1000,14 @@ class AudioManager: NSObject, ObservableObject {
     func togglePause() {
         guard isPlaying else { return }
         if isPaused {
-            // Resume — replay current station
+            // Resume — replay current station (reset error + fallback flag)
             if let station = currentStation, let url = URL(string: station.streamURL) {
+                triedFallbackURL = false
                 streamEngine.play(url: url)
             }
             DispatchQueue.main.async {
-                self.isPaused = false
+                self.isPaused    = false
+                self.streamError = nil
             }
         } else {
             streamEngine.stopStream()
@@ -1602,6 +1604,7 @@ struct TerminalStationRow: View {
     let index: Int
     @Binding var selectedIndex: Int
     @ObservedObject var audio: AudioManager
+    var isFavorite: Bool = false
     let terminalFont: Font
     var onPlay: (() -> Void)? = nil
 
@@ -1609,7 +1612,7 @@ struct TerminalStationRow: View {
 
     private var isSelected: Bool { index == selectedIndex }
     private var isPlaying: Bool {
-        audio.currentStation?.id == station.id && audio.isPlaying
+        audio.currentStation?.id == station.id && audio.isPlaying && !audio.isPaused
     }
 
     private let pushSpring = Animation.interpolatingSpring(stiffness: 280, damping: 28)
@@ -1626,14 +1629,28 @@ struct TerminalStationRow: View {
                 .clipped()
                 .animation(pushSpring, value: isSelected)
 
-            // Station name — fixed (no scroll); metadata scrolls to the right
-            let metaStr = station.metadataDisplayString
-            Text(station.name)
-                .font(terminalFont)
-                .foregroundColor(isPlaying ? Color(red: 0.98, green: 0.25, blue: 0.65) : .white)
-                .lineLimit(1)
-                .animation(pushSpring, value: isSelected)
+            // Icons + station name (fixed) — metadata scrolls to the right
+            HStack(spacing: 4) {
+                if isFavorite {
+                    FavoriteStarShape()
+                        .fill(Color.white)
+                        .frame(width: 10, height: 10)
+                }
+                if isPlaying {
+                    PlayTriangle()
+                        .fill(Color(red: 0.98, green: 0.25, blue: 0.65))
+                        .frame(width: 7, height: 8)
+                }
 
+                Text(station.name)
+                    .font(terminalFont)
+                    .foregroundColor(isPlaying ? Color(red: 0.98, green: 0.25, blue: 0.65) : .white)
+                    .lineLimit(1)
+            }
+            .animation(pushSpring, value: isSelected)
+            .animation(.easeOut(duration: 0.15), value: isPlaying)
+
+            let metaStr = station.metadataDisplayString
             if !metaStr.isEmpty {
                 Spacer().frame(width: 8)
                 MarqueeText(
@@ -1913,7 +1930,7 @@ struct AllStationsStationRow: View {
 
     private var isSelected: Bool { index == selectedIndex }
     private var isPlaying: Bool {
-        audio.currentStation?.id == station.id && audio.isPlaying
+        audio.currentStation?.id == station.id && audio.isPlaying && !audio.isPaused
     }
 
     private let textColor = Color(red: 0.157, green: 0.157, blue: 0.157) // Dark text for light background
@@ -2084,6 +2101,13 @@ struct AllStationsView: View {
                     .foregroundColor(textColor)
                     .opacity(idx == state.selectedGenreIndex ? 1.0 : 0.5)
                     .animation(.easeOut(duration: 0.1), value: state.selectedGenreIndex)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        guard idx != state.selectedGenreIndex else { return }
+                        withAnimation(searchSpring) {
+                            state.setGenre(to: idx)
+                        }
+                    }
             }
         }
     }
@@ -2179,6 +2203,73 @@ struct AllStationsView: View {
                 // When stations change (genre switch, search), update count then jump to top
                 liquidScroll.updateItemCount(count)
                 liquidScroll.jumpToTop()
+            }
+        }
+    }
+}
+
+// MARK: - Transport Buttons (press feedback)
+
+struct TransportButton: View {
+    let label: String
+    let font: Font
+    let action: () -> Void
+
+    @State private var pressed = false
+
+    var body: some View {
+        Text(label)
+            .font(font)
+            .foregroundColor(.white)
+            .opacity(pressed ? 0.5 : 1.0)
+            .scaleEffect(pressed ? 0.88 : 1.0, anchor: .center)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                pressed = true
+                action()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                    withAnimation(.interpolatingSpring(stiffness: 600, damping: 30)) {
+                        pressed = false
+                    }
+                }
+            }
+    }
+}
+
+struct PlayPauseButton: View {
+    let isPaused: Bool
+    let isPlaying: Bool
+    let action: () -> Void
+
+    @State private var pressed = false
+
+    /// When paused (or stopped), show a filled triangle (▶). When actively playing, show a hollow square (■).
+    private var showPlayGlyph: Bool { !isPlaying || isPaused }
+
+    var body: some View {
+        ZStack {
+            if showPlayGlyph {
+                PlayTriangle()
+                    .fill(Color.white)
+                    .frame(width: 9, height: 11)
+            } else {
+                Rectangle()
+                    .stroke(Color.white, lineWidth: 0.5)
+                    .frame(width: 11, height: 11)
+            }
+        }
+        .frame(width: 11, height: 11)
+        .opacity(pressed ? 0.5 : 1.0)
+        .scaleEffect(pressed ? 0.85 : 1.0, anchor: .center)
+        .padding(2)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            pressed = true
+            action()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                withAnimation(.interpolatingSpring(stiffness: 600, damping: 30)) {
+                    pressed = false
+                }
             }
         }
     }
@@ -2283,16 +2374,13 @@ struct ContentView: View {
             // Station name + << ■ >> transport controls on a single row
             // (Figma: 1294:2372 / 1294:2427 — stop square 11×11 stroked white)
             HStack(spacing: 8) {
-                Text("<<")
-                    .font(terminalFont)
-                    .foregroundColor(.white)
-                    .contentShape(Rectangle())
-                    .onTapGesture { sweepStation(direction: -1) }
+                TransportButton(label: "<<", font: terminalFont, action: { sweepStation(direction: -1) })
 
                 let isActive = audio.isPlaying && !audio.isPaused
                 let nameText: String = {
                     if let err = audio.streamError { return "⚠ \(err)" }
-                    if isActive { return audio.currentStation?.name ?? "Playing" }
+                    if let station = audio.currentStation { return station.name }
+                    if audio.isPlaying && audio.fileName != "No file selected" { return audio.fileName }
                     return "Not Playing"
                 }()
                 let nameColor: Color = audio.streamError != nil ? Color(red: 1.0, green: 0.45, blue: 0.35) : .white
@@ -2302,21 +2390,13 @@ struct ContentView: View {
                     color: nameColor,
                     isActive: isActive || audio.streamError != nil,
                     speed: 30,
-                    startDelay: 10.0,
-                    cycleDelay: 10.0
+                    startDelay: 1.5,
+                    cycleDelay: 2.0
                 )
 
-                Rectangle()
-                    .stroke(Color.white, lineWidth: 0.5)
-                    .frame(width: 11, height: 11)
-                    .contentShape(Rectangle())
-                    .onTapGesture { audio.togglePause() }
+                PlayPauseButton(isPaused: audio.isPaused, isPlaying: audio.isPlaying, action: { audio.togglePause() })
 
-                Text(">>")
-                    .font(terminalFont)
-                    .foregroundColor(.white)
-                    .contentShape(Rectangle())
-                    .onTapGesture { sweepStation(direction: 1) }
+                TransportButton(label: ">>", font: terminalFont, action: { sweepStation(direction: 1) })
             }
             .padding(.top, 4)
         }
@@ -2365,14 +2445,20 @@ struct ContentView: View {
                 Text("<")
                     .font(terminalFont)
                     .foregroundColor(.white.opacity(showRecents ? 1.0 : 0.25))
+                    .contentShape(Rectangle())
+                    .onTapGesture { if showRecents { toggleFavoritesRecents() } }
                 Spacer()
                 Text(showRecents ? "Recents" : "Favorites")
                     .font(terminalFont)
                     .foregroundColor(.white)
+                    .contentShape(Rectangle())
+                    .onTapGesture { toggleFavoritesRecents() }
                 Spacer()
                 Text(">")
                     .font(terminalFont)
                     .foregroundColor(.white.opacity(showRecents ? 0.25 : 1.0))
+                    .contentShape(Rectangle())
+                    .onTapGesture { if !showRecents { toggleFavoritesRecents() } }
             }
             .animation(pushSpring, value: showRecents)
 
@@ -2416,6 +2502,7 @@ struct ContentView: View {
                                 index: idx,
                                 selectedIndex: $selectedIndex,
                                 audio: audio,
+                                isFavorite: true,
                                 terminalFont: terminalFont,
                                 onPlay: { allStationsState.addRecent(station) }
                             )
@@ -2505,6 +2592,7 @@ struct ContentView: View {
                                 index: idx,
                                 selectedIndex: $selectedIndex,
                                 audio: audio,
+                                isFavorite: allStationsState.localFavorites.contains(station.id),
                                 terminalFont: terminalFont,
                                 onPlay: { allStationsState.addRecent(station) }
                             )
@@ -2617,9 +2705,7 @@ struct ContentView: View {
                     sweepStation(direction: -1)
                     return true
                 }
-                withAnimation(portalCurve) { showRecents.toggle() }
-                selectedIndex = 0
-                if showRecents { recentsScroll.jumpToTop() }
+                toggleFavoritesRecents()
                 return true
 
             case 124: // Right arrow
@@ -2627,9 +2713,7 @@ struct ContentView: View {
                     sweepStation(direction: 1)
                     return true
                 }
-                withAnimation(portalCurve) { showRecents.toggle() }
-                selectedIndex = 0
-                if showRecents { recentsScroll.jumpToTop() }
+                toggleFavoritesRecents()
                 return true
 
             case 2: // 'D' key — toggle debug panel
@@ -2783,16 +2867,38 @@ struct ContentView: View {
     }
 
     private func sweepStation(direction: Int) {
-        let favs = allStationsState.favoriteStations
-        guard !favs.isEmpty else { return }
+        let list = showRecents ? allStationsState.recentStations : allStationsState.favoriteStations
+        guard !list.isEmpty else { return }
 
-        var newIndex = selectedIndex + direction
-        if newIndex < 0 { newIndex = favs.count - 1 }
-        if newIndex >= favs.count { newIndex = 0 }
+        // Anchor on whichever index is currently playing (if present in the visible list),
+        // otherwise on the currently selected row.
+        let startIndex: Int = {
+            if let cur = audio.currentStation?.id, let i = list.firstIndex(where: { $0.id == cur }) {
+                return i
+            }
+            return min(max(0, selectedIndex), list.count - 1)
+        }()
+
+        var newIndex = startIndex + direction
+        if newIndex < 0 { newIndex = list.count - 1 }
+        if newIndex >= list.count { newIndex = 0 }
 
         selectedIndex = newIndex
-        audio.playStation(favs[newIndex])
-        allStationsState.addRecent(favs[newIndex])
+        audio.playStation(list[newIndex])
+        allStationsState.addRecent(list[newIndex])
+    }
+
+    /// Toggle between Favorites and Recents panels. Preserves focus on the
+    /// "All Stations" link if the user was already parked on it.
+    private func toggleFavoritesRecents() {
+        let oldCount  = showRecents ? allStationsState.recentStations.count : allStationsState.favoriteStations.count
+        let wasOnLink = selectedIndex == oldCount
+
+        withAnimation(portalCurve) { showRecents.toggle() }
+
+        let newCount = showRecents ? allStationsState.recentStations.count : allStationsState.favoriteStations.count
+        selectedIndex = wasOnLink ? newCount : 0
+        if showRecents { recentsScroll.jumpToTop() } else { favoritesScroll.jumpToTop() }
     }
 
     // MARK: - Visualizer calculations
