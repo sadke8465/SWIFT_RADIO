@@ -183,6 +183,7 @@ class AllStationsState: ObservableObject {
     private let baseURL = "https://de1.api.radio-browser.info/json"
     private let favoritesKey = "savedFavoriteStations"
     private let recentsKey = "savedRecentStations"
+    private let lastGenreKey = "lastSelectedGenreIndex"
 
     init() {
         if let data = UserDefaults.standard.data(forKey: "savedFavoriteStations"),
@@ -195,23 +196,35 @@ class AllStationsState: ObservableObject {
            let stations = try? JSONDecoder().decode([RadioStation].self, from: data) {
             recentStations = stations
         }
+        let savedGenre = UserDefaults.standard.integer(forKey: lastGenreKey)
+        if savedGenre >= 0 && savedGenre < genres.count {
+            selectedGenreIndex = savedGenre
+            previousGenreIndex = savedGenre
+        }
     }
 
     var filteredStations: [RadioStation] {
-        // Filter whenever text is present — isSearching only controls the search bar UI
-        if !searchText.isEmpty {
-            return currentStations.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        // Filter whenever text is present — isSearching only controls the search bar UI.
+        // Matches across name, tags, country, codec, bitrate (matches README contract).
+        let q = searchText.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return currentStations }
+        return currentStations.filter { s in
+            s.name.localizedCaseInsensitiveContains(q)
+                || s.tags.localizedCaseInsensitiveContains(q)
+                || s.country.localizedCaseInsensitiveContains(q)
+                || s.codec.localizedCaseInsensitiveContains(q)
+                || String(s.bitrate).contains(q)
         }
-        return currentStations
     }
 
     func setGenre(to index: Int) {
         if index >= 0 && index < genres.count {
             previousGenreIndex = selectedGenreIndex
             selectedGenreIndex = index
+            UserDefaults.standard.set(index, forKey: lastGenreKey)
         }
         selectedStationIndex = 0
-        
+
         let targetIndex = selectedGenreIndex
         
         if let cached = genreCache[targetIndex] {
@@ -494,8 +507,12 @@ class StreamAudioEngine: NSObject, URLSessionDataDelegate {
         vDSP_destroy_fftsetup(fftSetup)
     }
 
-    /// Debug logging flag — set to true to see FFT/decode diagnostics in console
+    /// Debug logging flag — FFT/decode diagnostics. Disabled in Release builds.
+    #if DEBUG
     var debugLogging = true
+    #else
+    var debugLogging = false
+    #endif
     private var fftCallCount = 0
     private var fftLastLogTime = Date()
     private var decodeCallCount = 0
@@ -945,6 +962,12 @@ class AudioManager: NSObject, ObservableObject {
 
     private let streamEngine = StreamAudioEngine()
     private var triedFallbackURL = false
+    /// Scheduled auto-dismiss for the current streamError banner — replaced when a
+    /// new error arrives so the timer always reflects the latest message.
+    private var errorDismissWork: DispatchWorkItem?
+    /// How long a transient error banner is shown before self-dismissing.
+    /// HIG: non-intrusive "toast" behavior rather than modal alert.
+    private let errorAutoDismissSeconds: TimeInterval = 5.0
 
     private var fileEngine = AVAudioEngine()
     private var filePlayer = AVAudioPlayerNode()
@@ -973,10 +996,26 @@ class AudioManager: NSObject, ObservableObject {
                     print("[PLAY] url_resolved failed — retrying with raw url: \(station.url)")
                     self.streamEngine.play(url: fallbackURL)
                 } else {
-                    self.streamError = message
+                    self.presentStreamError(message)
                 }
             }
         }
+    }
+
+    /// Show a non-intrusive error toast and schedule its auto-dismissal.
+    /// Always replaces any existing banner so the latest message wins.
+    private func presentStreamError(_ message: String) {
+        streamError = message
+        errorDismissWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            // Only clear if the user hasn't already resolved it (still the same message).
+            guard let self = self, self.streamError == message else { return }
+            withAnimation(.easeOut(duration: 0.25)) {
+                self.streamError = nil
+            }
+        }
+        errorDismissWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + errorAutoDismissSeconds, execute: work)
     }
 
     deinit {
@@ -1000,6 +1039,7 @@ class AudioManager: NSObject, ObservableObject {
             print("[PLAY] (raw url was: \(station.url))")
         }
         streamEngine.play(url: url)
+        errorDismissWork?.cancel()
         DispatchQueue.main.async {
             self.isPlaying      = true
             self.isPaused       = false
@@ -1132,11 +1172,22 @@ class AudioManager: NSObject, ObservableObject {
 
 class KeyboardEventHandler: ObservableObject {
     var onKeyEvent: ((NSEvent) -> Bool)?
-    private var monitor: Any?
+    /// Called on scroll wheel / trackpad scroll.  Return true to consume.
+    /// Receives the vertical scrolling delta in points (positive = content
+    /// scrolling up = user wants to move DOWN in the list).
+    var onScrollEvent: ((NSEvent) -> Bool)?
+    private var keyMonitor: Any?
+    private var scrollMonitor: Any?
 
     func install() {
-        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             if self?.onKeyEvent?(event) == true {
+                return nil // consumed
+            }
+            return event
+        }
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
+            if self?.onScrollEvent?(event) == true {
                 return nil // consumed
             }
             return event
@@ -1144,10 +1195,8 @@ class KeyboardEventHandler: ObservableObject {
     }
 
     func uninstall() {
-        if let m = monitor {
-            NSEvent.removeMonitor(m)
-            monitor = nil
-        }
+        if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
+        if let m = scrollMonitor { NSEvent.removeMonitor(m); scrollMonitor = nil }
     }
 
     deinit {
@@ -1175,6 +1224,36 @@ struct ThinDivider: View {
             .fill(Color.white.opacity(0.25))
             .frame(height: 1)
     }
+}
+
+// MARK: - Shake Effect (for invalid-action feedback)
+
+/// Horizontal shake driven by an animatable counter.  Increment the counter to
+/// trigger a damped-sinusoid oscillation, mimicking macOS password-field rejection
+/// feedback.  Pairs with NSHapticFeedbackManager for a tactile "thunk."
+struct ShakeEffect: GeometryEffect {
+    var amount: CGFloat = 6
+    var shakesPerUnit: CGFloat = 3
+    var animatableData: CGFloat
+
+    func effectValue(size: CGSize) -> ProjectionTransform {
+        let dx = amount * sin(animatableData * .pi * shakesPerUnit)
+        return ProjectionTransform(CGAffineTransform(translationX: dx, y: 0))
+    }
+}
+
+extension View {
+    /// Apply a one-shot shake animation, re-triggered every time `trigger` increments.
+    /// Wrap the caller's mutation in `withAnimation(.linear(duration: ~0.35))` for the
+    /// classic macOS rejection wobble.
+    func shake(trigger: Int) -> some View {
+        modifier(ShakeEffect(animatableData: CGFloat(trigger)))
+    }
+}
+
+/// Fires a short error haptic on the system feedback manager (trackpad "bump").
+@inline(__always) func fireInvalidActionHaptic() {
+    NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .now)
 }
 
 // MARK: - Tweak Slider (for Debug Window)
@@ -1633,6 +1712,7 @@ struct TerminalStationRow: View {
     var onPlay: (() -> Void)? = nil
 
     @State private var scale: CGFloat = 1.0
+    @State private var isHovered: Bool = false
 
     private var isSelected: Bool { index == selectedIndex }
     private var isPlaying: Bool {
@@ -1691,6 +1771,9 @@ struct TerminalStationRow: View {
         }
         .scaleEffect(scale, anchor: .leading)
         .contentShape(Rectangle())
+        .onHover { hovering in
+            isHovered = hovering
+        }
         .onTapGesture {
             scale = 0.97
             selectedIndex = index
@@ -1702,13 +1785,21 @@ struct TerminalStationRow: View {
         }
         .background(
             RoundedRectangle(cornerRadius: 3, style: .continuous)
-                .fill(Color.accentColor.opacity(isSelected ? 0.18 : 0))
-                .animation(.easeOut(duration: 0.1), value: isSelected)
+                .fill(Color.accentColor.opacity(rowTint))
+                .animation(.easeOut(duration: 0.12), value: isSelected)
+                .animation(.easeOut(duration: 0.08), value: isHovered)
         )
         .accessibilityElement(children: .combine)
         .accessibilityLabel(station.name + (isFavorite ? ", favorite" : ""))
         .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
         .accessibilityHint(isPlaying ? "Now playing" : "Press Enter to play")
+    }
+
+    /// Selection wins over hover; hover is a subtle hint.
+    private var rowTint: Double {
+        if isSelected { return 0.18 }
+        if isHovered  { return 0.08 }
+        return 0
     }
 }
 
@@ -1945,6 +2036,7 @@ struct AllStationsStationRow: View {
     var onPlay: (() -> Void)? = nil
 
     @State private var scale: CGFloat = 1.0
+    @State private var isHovered: Bool = false
 
     private var isSelected: Bool { index == selectedIndex }
     private var isPlaying: Bool {
@@ -2004,6 +2096,10 @@ struct AllStationsStationRow: View {
         }
         .scaleEffect(scale, anchor: .leading)
         .contentShape(Rectangle())
+        .onHover { hovering in
+            isHovered = hovering
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
         .onTapGesture {
             scale = 0.97
             selectedIndex = index
@@ -2015,13 +2111,20 @@ struct AllStationsStationRow: View {
         }
         .background(
             RoundedRectangle(cornerRadius: 3, style: .continuous)
-                .fill(Color.accentColor.opacity(isSelected ? 0.18 : 0))
-                .animation(.easeOut(duration: 0.1), value: isSelected)
+                .fill(Color.accentColor.opacity(rowTint))
+                .animation(.easeOut(duration: 0.12), value: isSelected)
+                .animation(.easeOut(duration: 0.08), value: isHovered)
         )
         .accessibilityElement(children: .combine)
         .accessibilityLabel(station.name + (isFavorite ? ", favorite" : ""))
         .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
         .accessibilityHint(isPlaying ? "Now playing" : "Press Enter to play")
+    }
+
+    private var rowTint: Double {
+        if isSelected { return 0.18 }
+        if isHovered  { return 0.08 }
+        return 0
     }
 }
 
@@ -2148,33 +2251,48 @@ struct AllStationsView: View {
     }
 
     private var loadingView: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 12) {
             Spacer()
-            Text("Loading")
+            // Native indeterminate progress — respects Dark Mode and Reduce Motion automatically.
+            ProgressView()
+                .progressViewStyle(.circular)
+                .controlSize(.small)
+                .tint(textColor)
+            Text("Loading stations…")
                 .font(terminalFont)
-                .foregroundColor(textColor)
-            Text("☻")
-                .font(terminalFont)
-                .foregroundColor(textColor)
-                .rotationEffect(.degrees(180))
+                .foregroundColor(textColor.opacity(0.7))
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Loading stations")
     }
 
+    /// Helpful empty state with a clear CTA. Copy adapts depending on whether the
+    /// empty list is due to a search filter or a genuinely empty catalog.
     private var emptyView: some View {
-        VStack(spacing: 8) {
+        let hasQuery = !state.searchText.trimmingCharacters(in: .whitespaces).isEmpty
+        return VStack(spacing: 10) {
             Spacer()
-            Text("No stations")
+            Image(systemName: hasQuery ? "magnifyingglass" : "antenna.radiowaves.left.and.right.slash")
+                .font(.system(size: 22, weight: .light))
+                .foregroundColor(textColor.opacity(0.5))
+            Text(hasQuery ? "No matches for “\(state.searchText)”" : "No stations available")
                 .font(terminalFont)
                 .foregroundColor(textColor)
-            Text("☻")
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 16)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(hasQuery ? "Press Esc to clear search" : "Try a different genre with ← →")
                 .font(terminalFont)
-                .foregroundColor(textColor)
-                .rotationEffect(.degrees(180))
+                .foregroundColor(textColor.opacity(0.5))
+                .lineLimit(1)
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(hasQuery ? "No matches for \(state.searchText). Press Escape to clear." : "No stations available. Try a different genre.")
     }
 
     @StateObject private var liquidScroll = LiquidScrollState()
@@ -2327,7 +2445,7 @@ struct ContentView: View {
     @State private var displayAmplitudes: [CGFloat] = Array(repeating: 0, count: 6)
     @State private var selectedIndex: Int = 0
     @State private var showAllStations: Bool = false
-    @State private var showRecents: Bool = false
+    @AppStorage("showRecentsPanel") private var showRecents: Bool = false
     @StateObject private var recentsScroll = LiquidScrollState()
     @StateObject private var favoritesScroll = LiquidScrollState()
 
@@ -2337,6 +2455,8 @@ struct ContentView: View {
     // Destructive-action confirmation state
     @State private var confirmDeleteStation: RadioStation? = nil
     @State private var confirmDeleteFocusIndex: Int = 0  // 0 = Cancel (default), 1 = Remove
+    // Shake feedback on invalid actions (HIG: password-field rejection)
+    @State private var invalidActionShake: Int = 0
 
     /// Computed responder zone — derived from existing state, no extra @State needed.
     private var currentZone: ResponderZone {
@@ -2397,6 +2517,7 @@ struct ContentView: View {
         .background(outerBG)
         .clipShape(RoundedRectangle(cornerRadius: Self.widgetCornerRadius, style: .continuous))
         .shadow(color: .black.opacity(0.25), radius: 16, x: 0, y: 8)
+        .shake(trigger: invalidActionShake)
         .animation(portalCurve, value: showAllStations)
         .fixedSize()
         .overlay(alignment: .bottom) { contextMenuOverlay }
@@ -2410,6 +2531,10 @@ struct ContentView: View {
         }
         .onDisappear {
             keyboard.uninstall()
+        }
+        // HIG: Cmd+, → open Settings. Posted by the app's CommandGroup replacement.
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsRequested)) { _ in
+            debugPanel.toggle(settings: settings, audio: audio)
         }
     }
 
@@ -2703,6 +2828,17 @@ struct ContentView: View {
     // MARK: - Station Row (terminal-style with animated chevron push)
     // Replaced by TerminalStationRow struct below
 
+    // MARK: - Invalid Action Feedback
+
+    /// Trigger a one-shot shake + haptic to indicate an invalid action
+    /// (e.g. pressing ↓ at the last row, ← at the leftmost genre).
+    private func signalInvalidAction() {
+        fireInvalidActionHaptic()
+        withAnimation(.linear(duration: 0.35)) {
+            invalidActionShake += 1
+        }
+    }
+
     // MARK: - Keyboard Handling (Zone-Based Routing)
 
     private func installKeyboard() {
@@ -2716,7 +2852,69 @@ struct ContentView: View {
             case .home:           return handleHomeKey(event)
             }
         }
+        keyboard.onScrollEvent = { event in
+            handleScrollEvent(event)
+        }
         keyboard.install()
+    }
+
+    // MARK: - Scroll Wheel / Trackpad (zone-routed like keyboard)
+
+    /// Accumulated scroll delta between row steps.  Persisted across events so a slow
+    /// two-finger trackpad drag still advances one row at the right moment.
+    @State private var scrollAccumulator: CGFloat = 0
+    /// Minimum vertical points per row step.  Tuned so a single trackpad "tick" of
+    /// inertia scrolling advances ~1 row.
+    private static let scrollRowThreshold: CGFloat = 14
+
+    private func handleScrollEvent(_ event: NSEvent) -> Bool {
+        // Only route scroll to zones where a list is visible.
+        // Modal overlays swallow it; search bar also swallows (consistent with
+        // keyboard, which ignores arrow keys while searching).
+        switch currentZone {
+        case .contextMenu, .confirmDelete, .search:
+            return true  // consume so background doesn't scroll behind modal
+        case .home, .browse:
+            break
+        }
+
+        // Natural-direction convention (matches Music.app): finger swipes up on
+        // trackpad (positive scrollingDeltaY) → list content scrolls up → focused
+        // row moves DOWN (index +1).
+        scrollAccumulator -= event.scrollingDeltaY
+
+        var steps = 0
+        while scrollAccumulator >= Self.scrollRowThreshold {
+            scrollAccumulator -= Self.scrollRowThreshold
+            steps += 1
+        }
+        while scrollAccumulator <= -Self.scrollRowThreshold {
+            scrollAccumulator += Self.scrollRowThreshold
+            steps -= 1
+        }
+        // Reset residual at the end of a gesture so we don't drift.
+        if event.phase == .ended || event.momentumPhase == .ended {
+            scrollAccumulator = 0
+        }
+
+        guard steps != 0 else { return true }
+
+        switch currentZone {
+        case .browse:
+            let last = allStationsState.filteredStations.count - 1
+            guard last >= 0 else { return true }
+            let next = max(0, min(last, allStationsState.selectedStationIndex + steps))
+            allStationsState.selectedStationIndex = next
+        case .home:
+            let listCount = showRecents ? allStationsState.recentStations.count : allStationsState.favoriteStations.count
+            let last = listCount  // Virtual "All Stations" link lives at [listCount]
+            guard listCount > 0 else { return true }
+            let next = max(0, min(last, selectedIndex + steps))
+            selectedIndex = next
+        default:
+            break
+        }
+        return true
     }
 
     // MARK: - Home Panel (Favorites / Recents)
@@ -2732,16 +2930,16 @@ struct ContentView: View {
         switch event.keyCode {
         // ── Core navigation ──────────────────────────────────────────
         case 126:             // ↑ Arrow
-            if selectedIndex > 0 { selectedIndex -= 1 }
+            if selectedIndex > 0 { selectedIndex -= 1 } else { signalInvalidAction() }
             return true
         case 125:             // ↓ Arrow
-            if selectedIndex < lastIdx { selectedIndex += 1 }
+            if selectedIndex < lastIdx { selectedIndex += 1 } else { signalInvalidAction() }
             return true
         case 40 where !cmd:   // k — Vim up
-            if selectedIndex > 0 { selectedIndex -= 1 }
+            if selectedIndex > 0 { selectedIndex -= 1 } else { signalInvalidAction() }
             return true
         case 38 where !cmd:   // j — Vim down
-            if selectedIndex < lastIdx { selectedIndex += 1 }
+            if selectedIndex < lastIdx { selectedIndex += 1 } else { signalInvalidAction() }
             return true
         case 115:             // Home → first item
             selectedIndex = 0
@@ -2781,6 +2979,7 @@ struct ContentView: View {
 
         // ── Hierarchy navigation (Cmd+[ / Cmd+]) ─────────────────────
         case 33 where cmd:    // Cmd+[ — no-op at root; consume to avoid beep
+            signalInvalidAction()
             return true
         case 30 where cmd:    // Cmd+] — forward → All Stations
             enterAllStations()
@@ -2804,7 +3003,10 @@ struct ContentView: View {
 
         // ── Destructive action (Cmd+Delete) ──────────────────────────
         case 51 where cmd:    // Cmd+⌫ — remove from Favorites (not Recents)
-            guard !showRecents, selectedIndex < allStationsState.favoriteStations.count else { return false }
+            guard !showRecents, selectedIndex < allStationsState.favoriteStations.count else {
+                signalInvalidAction()
+                return true
+            }
             confirmDeleteStation = allStationsState.favoriteStations[selectedIndex]
             confirmDeleteFocusIndex = 0  // Default focus: Cancel
             return true
@@ -2868,13 +3070,22 @@ struct ContentView: View {
             return true
 
         default:
-            // Reject modifier combos; accept printable ASCII
+            // Reject modifier combos; accept any printable character (Unicode, emoji, accents).
+            // Filtering to printable means: exclude control characters (U+0000–U+001F, U+007F)
+            // but allow everything else including CJK, emoji, diacritics.
             guard !cmd else { return false }
-            if let chars = event.characters?.filter({
-                $0.unicodeScalars.allSatisfy { $0.value >= 32 && $0.value < 127 }
-            }), !chars.isEmpty {
-                allStationsState.searchText += chars
-                allStationsState.selectedStationIndex = 0
+            if let raw = event.characters, !raw.isEmpty {
+                let chars = raw.filter { ch in
+                    ch.unicodeScalars.allSatisfy { scalar in
+                        let v = scalar.value
+                        return v >= 32 && v != 0x7F
+                    }
+                }
+                if !chars.isEmpty, allStationsState.searchText.count < 256 {
+                    let remaining = 256 - allStationsState.searchText.count
+                    allStationsState.searchText += String(chars.prefix(remaining))
+                    allStationsState.selectedStationIndex = 0
+                }
             }
             return true
         }
@@ -2901,23 +3112,31 @@ struct ContentView: View {
         case 126:             // ↑ Arrow
             if allStationsState.selectedStationIndex > 0 {
                 allStationsState.selectedStationIndex -= 1
+            } else {
+                signalInvalidAction()
             }
             return true
         case 125:             // ↓ Arrow
             let last = allStationsState.filteredStations.count - 1
             if allStationsState.selectedStationIndex < last {
                 allStationsState.selectedStationIndex += 1
+            } else {
+                signalInvalidAction()
             }
             return true
         case 40 where !cmd:   // k — Vim up
             if allStationsState.selectedStationIndex > 0 {
                 allStationsState.selectedStationIndex -= 1
+            } else {
+                signalInvalidAction()
             }
             return true
         case 38 where !cmd:   // j — Vim down
             let last = allStationsState.filteredStations.count - 1
             if allStationsState.selectedStationIndex < last {
                 allStationsState.selectedStationIndex += 1
+            } else {
+                signalInvalidAction()
             }
             return true
         case 115:             // Home
@@ -2949,6 +3168,8 @@ struct ContentView: View {
                 withAnimation(portalCurve) {
                     allStationsState.setGenre(to: allStationsState.selectedGenreIndex + 1)
                 }
+            } else {
+                signalInvalidAction()
             }
             return true
 
@@ -2981,6 +3202,7 @@ struct ContentView: View {
             exitAllStations()
             return true
         case 30 where cmd:    // Cmd+] — no forward level; consume
+            signalInvalidAction()
             return true
 
         // ── Favorites & context ───────────────────────────────────────
@@ -3327,6 +3549,13 @@ struct WindowAccessor: NSViewRepresentable {
 
 // MARK: - App Entry Point
 
+/// Notification fired when the user invokes the standard macOS Settings shortcut (Cmd+,)
+/// or chooses the Settings menu item. ContentView listens for this to toggle the
+/// Tweak panel in-place — aligning with HIG "Cmd+, opens Settings" convention.
+extension Notification.Name {
+    static let openSettingsRequested = Notification.Name("SwiftRadio.openSettingsRequested")
+}
+
 @main
 struct AV_TesterApp: App {
     var body: some Scene {
@@ -3336,5 +3565,16 @@ struct AV_TesterApp: App {
         }
         .windowResizability(.contentSize)
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            // HIG: Cmd+, is the universal macOS Settings shortcut. Replace the default
+            // (which opens a separate Settings scene) with a notification that our
+            // ContentView receives and uses to toggle the Tweak panel.
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") {
+                    NotificationCenter.default.post(name: .openSettingsRequested, object: nil)
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
+        }
     }
 }
