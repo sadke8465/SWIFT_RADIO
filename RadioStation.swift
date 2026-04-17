@@ -198,7 +198,8 @@ class AllStationsState: ObservableObject {
     }
 
     var filteredStations: [RadioStation] {
-        if isSearching && !searchText.isEmpty {
+        // Filter whenever text is present — isSearching only controls the search bar UI
+        if !searchText.isEmpty {
             return currentStations.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
         }
         return currentStations
@@ -319,6 +320,17 @@ class AllStationsState: ObservableObject {
         } else {
             favoriteStations.append(station)
         }
+        saveFavorites()
+    }
+
+    func addFavorite(_ station: RadioStation) {
+        guard !localFavorites.contains(station.id) else { return }
+        favoriteStations.append(station)
+        saveFavorites()
+    }
+
+    func removeFavorite(_ station: RadioStation) {
+        favoriteStations.removeAll { $0.id == station.id }
         saveFavorites()
     }
 
@@ -1143,6 +1155,18 @@ class KeyboardEventHandler: ObservableObject {
     }
 }
 
+// MARK: - Responder Zone (central keyboard routing coordinator)
+
+/// Tracks which UI "zone" currently owns keyboard responder priority.
+/// Computed from existing state in ContentView — no separate @State needed.
+enum ResponderZone: Equatable {
+    case home           // Favorites / Recents panel (main widget)
+    case browse         // All Stations list (no search bar open)
+    case search         // All Stations search bar is receiving input
+    case contextMenu    // Station context popup is open
+    case confirmDelete  // Destructive-action confirmation sheet is open
+}
+
 // MARK: - Thin Divider (matches Figma)
 
 struct ThinDivider: View {
@@ -1676,6 +1700,15 @@ struct TerminalStationRow: View {
                 withAnimation(squishSpring) { scale = 1.0 }
             }
         }
+        .background(
+            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                .fill(Color.accentColor.opacity(isSelected ? 0.18 : 0))
+                .animation(.easeOut(duration: 0.1), value: isSelected)
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(station.name + (isFavorite ? ", favorite" : ""))
+        .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
+        .accessibilityHint(isPlaying ? "Now playing" : "Press Enter to play")
     }
 }
 
@@ -1806,9 +1839,9 @@ class LiquidScrollState: ObservableObject {
         bottomAlignmentPadding = rem > 0 ? sh - rem : 0
     }
 
-    /// Scroll so the selected item is fully visible, snapping to exact item boundaries.
-    /// The offset is always a multiple of slotHeight so no item is ever clipped.
-    /// Navigation moves the viewport by exactly one item height at a time.
+    /// Scroll so the selected item is centered in the viewport, snapping to exact
+    /// item boundaries.  The offset is always a multiple of slotHeight so no item
+    /// is ever pixel-clipped at the top.
     func scrollToIndex(_ index: Int, totalItems: Int) {
         guard totalItems > 0 else { return }
 
@@ -1818,27 +1851,12 @@ class LiquidScrollState: ObservableObject {
         }
 
         let sh = slotHeight
-        // How many complete items fit in the viewport
         let visibleCount = max(1, Int((viewportHeight + 4) / sh))
 
-        // Which item is currently the first visible one (targetOffset is always a
-        // multiple of slotHeight, so this division is exact after the first scroll)
-        let currentFirstVisible = Int(targetOffset / sh)
-
-        var newFirstVisible = currentFirstVisible
-        if index < currentFirstVisible {
-            // Selected item is above the visible window — scroll up
-            newFirstVisible = index
-        } else if index >= currentFirstVisible + visibleCount {
-            // Selected item is below the visible window — scroll down
-            newFirstVisible = index - visibleCount + 1
-        } else {
-            return // Already fully visible; no scroll needed
-        }
-
-        // maxOffset is slot-aligned, so dividing by sh gives an exact integer
+        // Center the focused item; push toward the start/end when near boundaries
+        let idealFirst = index - visibleCount / 2
         let maxFirstVisible = max(0, Int((maxOffset / sh).rounded()))
-        newFirstVisible = max(0, min(newFirstVisible, maxFirstVisible))
+        let newFirstVisible = max(0, min(idealFirst, maxFirstVisible))
 
         let newOffset = min(CGFloat(newFirstVisible) * sh, maxOffset)
         retarget(newOffset)
@@ -1995,6 +2013,15 @@ struct AllStationsStationRow: View {
                 withAnimation(squishSpring) { scale = 1.0 }
             }
         }
+        .background(
+            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                .fill(Color.accentColor.opacity(isSelected ? 0.18 : 0))
+                .animation(.easeOut(duration: 0.1), value: isSelected)
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(station.name + (isFavorite ? ", favorite" : ""))
+        .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
+        .accessibilityHint(isPlaying ? "Now playing" : "Press Enter to play")
     }
 }
 
@@ -2072,7 +2099,7 @@ struct AllStationsView: View {
                     .foregroundColor(textColor)
                     .lineLimit(1)
             }
-            
+
             // Blinking Line Cursor (Figma 1294:2686 & UX Audit 5B)
             Rectangle()
                 .fill(textColor)
@@ -2083,7 +2110,7 @@ struct AllStationsView: View {
                         cursorVisible = false
                     }
                 }
-            
+
             if state.searchText.isEmpty {
                 Text("Search")
                     .font(terminalFont)
@@ -2091,6 +2118,11 @@ struct AllStationsView: View {
                     .lineLimit(1)
             }
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityRole(.searchField)
+        .accessibilityLabel("Search stations")
+        .accessibilityValue(state.searchText)
+        .accessibilityHint("Type to filter. Down arrow moves to results. Escape clears.")
     }
 
     private var genreBar: some View {
@@ -2108,6 +2140,9 @@ struct AllStationsView: View {
                             state.setGenre(to: idx)
                         }
                     }
+                    .accessibilityRole(.tab)
+                    .accessibilityLabel(genre)
+                    .accessibilityAddTraits(idx == state.selectedGenreIndex ? .isSelected : [])
             }
         }
     }
@@ -2214,6 +2249,7 @@ struct TransportButton: View {
     let label: String
     let font: Font
     let action: () -> Void
+    var a11yLabel: String = ""
 
     @State private var pressed = false
 
@@ -2233,6 +2269,8 @@ struct TransportButton: View {
                     }
                 }
             }
+            .accessibilityRole(.button)
+            .accessibilityLabel(a11yLabel.isEmpty ? label : a11yLabel)
     }
 }
 
@@ -2272,6 +2310,8 @@ struct PlayPauseButton: View {
                 }
             }
         }
+        .accessibilityRole(.button)
+        .accessibilityLabel(showPlayGlyph ? "Play" : "Pause")
     }
 }
 
@@ -2290,6 +2330,21 @@ struct ContentView: View {
     @State private var showRecents: Bool = false
     @StateObject private var recentsScroll = LiquidScrollState()
     @StateObject private var favoritesScroll = LiquidScrollState()
+
+    // Context menu overlay state
+    @State private var contextMenuStation: RadioStation? = nil
+    @State private var contextMenuFocusIndex: Int = 0
+    // Destructive-action confirmation state
+    @State private var confirmDeleteStation: RadioStation? = nil
+    @State private var confirmDeleteFocusIndex: Int = 0  // 0 = Cancel (default), 1 = Remove
+
+    /// Computed responder zone — derived from existing state, no extra @State needed.
+    private var currentZone: ResponderZone {
+        if contextMenuStation != nil { return .contextMenu }
+        if confirmDeleteStation != nil { return .confirmDelete }
+        if showAllStations { return allStationsState.isSearching ? .search : .browse }
+        return .home
+    }
 
     private let debugPanel = DebugPanelController()
     private let frameTimer = Timer.publish(every: 1.0 / 120.0, on: .main, in: .common).autoconnect()
@@ -2344,6 +2399,8 @@ struct ContentView: View {
         .shadow(color: .black.opacity(0.25), radius: 16, x: 0, y: 8)
         .animation(portalCurve, value: showAllStations)
         .fixedSize()
+        .overlay(alignment: .bottom) { contextMenuOverlay }
+        .overlay { confirmDeleteOverlay }
         .onReceive(frameTimer) { _ in
             updateVisuals()
         }
@@ -2374,7 +2431,7 @@ struct ContentView: View {
             // Station name + << ■ >> transport controls on a single row
             // (Figma: 1294:2372 / 1294:2427 — stop square 11×11 stroked white)
             HStack(spacing: 8) {
-                TransportButton(label: "<<", font: terminalFont, action: { sweepStation(direction: -1) })
+                TransportButton(label: "<<", font: terminalFont, action: { sweepStation(direction: -1) }, a11yLabel: "Previous station")
 
                 let isActive = audio.isPlaying && !audio.isPaused
                 let nameText: String = {
@@ -2396,7 +2453,7 @@ struct ContentView: View {
 
                 PlayPauseButton(isPaused: audio.isPaused, isPlaying: audio.isPlaying, action: { audio.togglePause() })
 
-                TransportButton(label: ">>", font: terminalFont, action: { sweepStation(direction: 1) })
+                TransportButton(label: ">>", font: terminalFont, action: { sweepStation(direction: 1) }, a11yLabel: "Next station")
             }
             .padding(.top, 4)
         }
@@ -2568,6 +2625,10 @@ struct ContentView: View {
         .onTapGesture {
             enterAllStations()
         }
+        .accessibilityRole(.button)
+        .accessibilityLabel("All Stations")
+        .accessibilityHint("Browse all available stations")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
     @ViewBuilder
@@ -2642,132 +2703,157 @@ struct ContentView: View {
     // MARK: - Station Row (terminal-style with animated chevron push)
     // Replaced by TerminalStationRow struct below
 
-    // MARK: - Keyboard Handling
+    // MARK: - Keyboard Handling (Zone-Based Routing)
 
     private func installKeyboard() {
         keyboard.onKeyEvent = { event in
-            // Route to all-stations handler when active
-            if showAllStations {
-                return handleAllStationsKey(event)
-            }
-
-            let shift = event.modifierFlags.contains(.shift)
-
-            switch event.keyCode {
-            case 126: // Up arrow
-                if selectedIndex > 0 {
-                    selectedIndex -= 1
-                }
-                return true
-
-            case 125: // Down arrow
-                if showRecents {
-                    if selectedIndex < allStationsState.recentStations.count {
-                        selectedIndex += 1
-                    }
-                } else {
-                    if selectedIndex < allStationsState.favoriteStations.count {
-                        selectedIndex += 1
-                    }
-                }
-                return true
-
-            case 36: // Enter / Return
-                if showRecents {
-                    if selectedIndex == allStationsState.recentStations.count {
-                        enterAllStations()
-                        return true
-                    }
-                    if selectedIndex < allStationsState.recentStations.count {
-                        let s = allStationsState.recentStations[selectedIndex]
-                        audio.playStation(s)
-                        allStationsState.addRecent(s)
-                    }
-                    return true
-                }
-                if selectedIndex == allStationsState.favoriteStations.count {
-                    enterAllStations()
-                    return true
-                }
-                if selectedIndex < allStationsState.favoriteStations.count {
-                    let s = allStationsState.favoriteStations[selectedIndex]
-                    audio.playStation(s)
-                    allStationsState.addRecent(s)
-                }
-                return true
-
-            case 49: // Space
-                audio.togglePause()
-                return true
-
-            case 123: // Left arrow
-                if shift {
-                    sweepStation(direction: -1)
-                    return true
-                }
-                toggleFavoritesRecents()
-                return true
-
-            case 124: // Right arrow
-                if shift {
-                    sweepStation(direction: 1)
-                    return true
-                }
-                toggleFavoritesRecents()
-                return true
-
-            case 2: // 'D' key — toggle debug panel
-                debugPanel.toggle(settings: settings, audio: audio)
-                return true
-
-            case 9: // 'V' key — cycle visualizer preset
-                settings.cyclePreset()
-                return true
-
-            default:
-                return false
+            // Overlay zones trap all input; derived from state, no extra @State needed.
+            switch currentZone {
+            case .contextMenu:    return handleContextMenuKey(event)
+            case .confirmDelete:  return handleConfirmDeleteKey(event)
+            case .search:         return handleSearchKey(event)
+            case .browse:         return handleAllStationsNavKey(event)
+            case .home:           return handleHomeKey(event)
             }
         }
         keyboard.install()
     }
 
-    // MARK: - All Stations Key Handling
+    // MARK: - Home Panel (Favorites / Recents)
 
-    private func handleAllStationsKey(_ event: NSEvent) -> Bool {
-        if allStationsState.isSearching {
-            return handleSearchKey(event)
+    private func handleHomeKey(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let cmd   = flags.contains(.command)
+        let shift = flags.contains(.shift)
+
+        let list    = showRecents ? allStationsState.recentStations : allStationsState.favoriteStations
+        let lastIdx = list.count  // "All Stations" link lives at this virtual index
+
+        switch event.keyCode {
+        // ── Core navigation ──────────────────────────────────────────
+        case 126:             // ↑ Arrow
+            if selectedIndex > 0 { selectedIndex -= 1 }
+            return true
+        case 125:             // ↓ Arrow
+            if selectedIndex < lastIdx { selectedIndex += 1 }
+            return true
+        case 40 where !cmd:   // k — Vim up
+            if selectedIndex > 0 { selectedIndex -= 1 }
+            return true
+        case 38 where !cmd:   // j — Vim down
+            if selectedIndex < lastIdx { selectedIndex += 1 }
+            return true
+        case 115:             // Home → first item
+            selectedIndex = 0
+            return true
+        case 119:             // End → All Stations link
+            selectedIndex = lastIdx
+            return true
+        case 116:             // Page Up
+            selectedIndex = max(0, selectedIndex - 5)
+            return true
+        case 121:             // Page Down
+            selectedIndex = min(lastIdx, selectedIndex + 5)
+            return true
+
+        // ── Primary actions ───────────────────────────────────────────
+        case 36:              // Enter — play selected or enter All Stations
+            if selectedIndex == lastIdx { enterAllStations(); return true }
+            if selectedIndex < list.count {
+                let s = list[selectedIndex]
+                audio.playStation(s)
+                allStationsState.addRecent(s)
+            }
+            return true
+        case 49:              // Space — toggle pause/resume (media player convention)
+            audio.togglePause()
+            return true
+
+        // ── Panel & sweep navigation ──────────────────────────────────
+        case 123:             // ← Arrow
+            if shift { sweepStation(direction: -1); return true }
+            toggleFavoritesRecents()
+            return true
+        case 124:             // → Arrow
+            if shift { sweepStation(direction: 1); return true }
+            toggleFavoritesRecents()
+            return true
+
+        // ── Hierarchy navigation (Cmd+[ / Cmd+]) ─────────────────────
+        case 33 where cmd:    // Cmd+[ — no-op at root; consume to avoid beep
+            return true
+        case 30 where cmd:    // Cmd+] — forward → All Stations
+            enterAllStations()
+            return true
+
+        // ── Search activation (Cmd+F or /) ───────────────────────────
+        case 3 where cmd:     // Cmd+F
+            enterAllStations(); openSearch()
+            return true
+        case 44 where !cmd:   // /
+            enterAllStations(); openSearch()
+            return true
+
+        // ── Context menu (M or Shift+F10) ────────────────────────────
+        case 46:              // M
+            openContextMenu()
+            return true
+        case 109 where shift: // Shift+F10
+            openContextMenu()
+            return true
+
+        // ── Destructive action (Cmd+Delete) ──────────────────────────
+        case 51 where cmd:    // Cmd+⌫ — remove from Favorites (not Recents)
+            guard !showRecents, selectedIndex < allStationsState.favoriteStations.count else { return false }
+            confirmDeleteStation = allStationsState.favoriteStations[selectedIndex]
+            confirmDeleteFocusIndex = 0  // Default focus: Cancel
+            return true
+
+        // ── Utility ───────────────────────────────────────────────────
+        case 2: debugPanel.toggle(settings: settings, audio: audio); return true  // D
+        case 9: settings.cyclePreset(); return true                               // V
+        default: return false
         }
-        return handleAllStationsNavKey(event)
     }
 
+    // MARK: - All Stations Search Bar
+
     private func handleSearchKey(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let cmd   = flags.contains(.command)
+
         switch event.keyCode {
-        case 53: // Escape — close search only
+        case 53:              // Escape — clear search and close bar
             withAnimation(.timingCurve(0.15, 0, 0, 1, duration: 0.3)) {
                 allStationsState.isSearching = false
-                allStationsState.searchText = ""
+                allStationsState.searchText  = ""
                 allStationsState.selectedStationIndex = 0
             }
             return true
-        case 36: // Enter — play selected
+
+        case 125:             // ↓ Arrow — transfer focus to the first result
+            withAnimation(.timingCurve(0.15, 0, 0, 1, duration: 0.3)) {
+                allStationsState.isSearching = false  // Hide bar; filter persists via searchText
+            }
+            allStationsState.selectedStationIndex = 0
+            return true
+
+        case 126:             // ↑ Arrow — no-op while typing
+            return true
+
+        case 36:              // Enter — play selected, close bar
             let stations = allStationsState.filteredStations
             if allStationsState.selectedStationIndex < stations.count {
                 let s = stations[allStationsState.selectedStationIndex]
                 audio.playStation(s)
                 allStationsState.addRecent(s)
             }
-            return true
-        case 126: // Up
-            if allStationsState.selectedStationIndex > 0 {
-                allStationsState.selectedStationIndex -= 1
+            withAnimation(.timingCurve(0.15, 0, 0, 1, duration: 0.3)) {
+                allStationsState.isSearching = false
             }
             return true
-        case 125: // Down
-            if allStationsState.selectedStationIndex < allStationsState.filteredStations.count - 1 {
-                allStationsState.selectedStationIndex += 1
-            }
-            return true
-        case 51: // Backspace
+
+        case 51:              // Backspace
             if !allStationsState.searchText.isEmpty {
                 allStationsState.searchText.removeLast()
                 allStationsState.selectedStationIndex = 0
@@ -2777,8 +2863,16 @@ struct ContentView: View {
                 }
             }
             return true
+
+        case 3 where cmd:     // Cmd+F — already searching; no-op
+            return true
+
         default:
-            if let chars = event.characters?.filter({ $0.unicodeScalars.allSatisfy { $0.value >= 32 && $0.value < 127 } }), !chars.isEmpty {
+            // Reject modifier combos; accept printable ASCII
+            guard !cmd else { return false }
+            if let chars = event.characters?.filter({
+                $0.unicodeScalars.allSatisfy { $0.value >= 32 && $0.value < 127 }
+            }), !chars.isEmpty {
                 allStationsState.searchText += chars
                 allStationsState.selectedStationIndex = 0
             }
@@ -2786,22 +2880,62 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - All Stations Browse
+
     private func handleAllStationsNavKey(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let cmd   = flags.contains(.command)
+        let shift = flags.contains(.shift)
+
         switch event.keyCode {
-        case 53: // Escape — exit all stations
-            exitAllStations()
+        // ── Escape: clear filter first, then exit ─────────────────────
+        case 53:
+            if !allStationsState.searchText.isEmpty {
+                allStationsState.searchText = ""
+            } else {
+                exitAllStations()
+            }
             return true
-        case 126: // Up
+
+        // ── Core navigation ──────────────────────────────────────────
+        case 126:             // ↑ Arrow
             if allStationsState.selectedStationIndex > 0 {
                 allStationsState.selectedStationIndex -= 1
             }
             return true
-        case 125: // Down
-            if allStationsState.selectedStationIndex < allStationsState.filteredStations.count - 1 {
+        case 125:             // ↓ Arrow
+            let last = allStationsState.filteredStations.count - 1
+            if allStationsState.selectedStationIndex < last {
                 allStationsState.selectedStationIndex += 1
             }
             return true
-        case 123: // Left — previous genre or exit
+        case 40 where !cmd:   // k — Vim up
+            if allStationsState.selectedStationIndex > 0 {
+                allStationsState.selectedStationIndex -= 1
+            }
+            return true
+        case 38 where !cmd:   // j — Vim down
+            let last = allStationsState.filteredStations.count - 1
+            if allStationsState.selectedStationIndex < last {
+                allStationsState.selectedStationIndex += 1
+            }
+            return true
+        case 115:             // Home
+            allStationsState.selectedStationIndex = 0
+            return true
+        case 119:             // End
+            allStationsState.selectedStationIndex = max(0, allStationsState.filteredStations.count - 1)
+            return true
+        case 116:             // Page Up
+            allStationsState.selectedStationIndex = max(0, allStationsState.selectedStationIndex - 5)
+            return true
+        case 121:             // Page Down
+            let last = max(0, allStationsState.filteredStations.count - 1)
+            allStationsState.selectedStationIndex = min(last, allStationsState.selectedStationIndex + 5)
+            return true
+
+        // ── Genre navigation ──────────────────────────────────────────
+        case 123:             // ← — previous genre or exit
             if allStationsState.selectedGenreIndex > 0 {
                 withAnimation(portalCurve) {
                     allStationsState.setGenre(to: allStationsState.selectedGenreIndex - 1)
@@ -2810,14 +2944,16 @@ struct ContentView: View {
                 exitAllStations()
             }
             return true
-        case 124: // Right — next genre
+        case 124:             // → — next genre
             if allStationsState.selectedGenreIndex < allStationsState.genres.count - 1 {
                 withAnimation(portalCurve) {
                     allStationsState.setGenre(to: allStationsState.selectedGenreIndex + 1)
                 }
             }
             return true
-        case 36: // Enter — play selected station
+
+        // ── Primary actions ───────────────────────────────────────────
+        case 36:              // Enter — play selected
             let stations = allStationsState.filteredStations
             if allStationsState.selectedStationIndex < stations.count {
                 let s = stations[allStationsState.selectedStationIndex]
@@ -2825,25 +2961,138 @@ struct ContentView: View {
                 allStationsState.addRecent(s)
             }
             return true
-        case 1: // S key — toggle search
-            withAnimation(.timingCurve(0.15, 0, 0, 1, duration: 0.3)) {
-                allStationsState.isSearching = true
-            }
-            return true
-        case 3: // F key — toggle favorite
-            allStationsState.toggleFavorite()
-            return true
-        case 49: // Space
+        case 49:              // Space — toggle pause/resume
             audio.togglePause()
             return true
-        case 2: // D
-            debugPanel.toggle(settings: settings, audio: audio)
+
+        // ── Search activation ─────────────────────────────────────────
+        case 1:               // S
+            openSearch()
             return true
-        case 9: // V
-            settings.cyclePreset()
+        case 3 where cmd:     // Cmd+F
+            openSearch()
+            return true
+        case 44 where !cmd:   // /
+            openSearch()
+            return true
+
+        // ── Hierarchy navigation ──────────────────────────────────────
+        case 33 where cmd:    // Cmd+[ — back to home
+            exitAllStations()
+            return true
+        case 30 where cmd:    // Cmd+] — no forward level; consume
+            return true
+
+        // ── Favorites & context ───────────────────────────────────────
+        case 3:               // F — toggle favorite (no Cmd modifier)
+            allStationsState.toggleFavorite()
+            return true
+        case 46:              // M — context menu
+            openContextMenu()
+            return true
+        case 109 where shift: // Shift+F10 — context menu
+            openContextMenu()
+            return true
+
+        // ── Utility ───────────────────────────────────────────────────
+        case 2: debugPanel.toggle(settings: settings, audio: audio); return true  // D
+        case 9: settings.cyclePreset(); return true                               // V
+        default: return false
+        }
+    }
+
+    // MARK: - Search / Context / Confirm Helpers
+
+    private func openSearch() {
+        withAnimation(.timingCurve(0.15, 0, 0, 1, duration: 0.3)) {
+            allStationsState.isSearching = true
+        }
+        allStationsState.selectedStationIndex = 0
+    }
+
+    private func openContextMenu() {
+        let station: RadioStation?
+        if showAllStations {
+            let idx = allStationsState.selectedStationIndex
+            let stations = allStationsState.filteredStations
+            station = idx < stations.count ? stations[idx] : nil
+        } else {
+            let list = showRecents ? allStationsState.recentStations : allStationsState.favoriteStations
+            station = selectedIndex < list.count ? list[selectedIndex] : nil
+        }
+        guard let s = station else { return }
+        contextMenuStation   = s
+        contextMenuFocusIndex = 0
+    }
+
+    // MARK: - Context Menu Key Handler (focus trapped inside overlay)
+
+    private func handleContextMenuKey(_ event: NSEvent) -> Bool {
+        switch event.keyCode {
+        case 53:          // Escape — dismiss
+            contextMenuStation = nil
+            return true
+        case 48:          // Tab — cycle forward through items
+            contextMenuFocusIndex = (contextMenuFocusIndex + 1) % 3
+            return true
+        case 126:         // ↑ — move up
+            if contextMenuFocusIndex > 0 { contextMenuFocusIndex -= 1 }
+            return true
+        case 125:         // ↓ — move down
+            if contextMenuFocusIndex < 2 { contextMenuFocusIndex += 1 }
+            return true
+        case 36, 49:      // Enter / Space — execute
+            executeContextMenuAction()
             return true
         default:
-            return false
+            return true   // Trap all other keys (no leakage to background)
+        }
+    }
+
+    private func executeContextMenuAction() {
+        guard let station = contextMenuStation else { return }
+        switch contextMenuFocusIndex {
+        case 0:  // Play
+            audio.playStation(station)
+            allStationsState.addRecent(station)
+        case 1:  // Toggle Favorite
+            if allStationsState.localFavorites.contains(station.id) {
+                allStationsState.removeFavorite(station)
+            } else {
+                allStationsState.addFavorite(station)
+            }
+        default: break
+        }
+        contextMenuStation = nil
+    }
+
+    // MARK: - Confirm Delete Key Handler (focus trapped inside dialog)
+
+    private func handleConfirmDeleteKey(_ event: NSEvent) -> Bool {
+        switch event.keyCode {
+        case 53:          // Escape — cancel (same as "Cancel" button)
+            confirmDeleteStation = nil
+            return true
+        case 48:          // Tab — toggle between Cancel / Remove
+            confirmDeleteFocusIndex = confirmDeleteFocusIndex == 0 ? 1 : 0
+            return true
+        case 126:         // ↑ — focus Cancel
+            confirmDeleteFocusIndex = 0
+            return true
+        case 125:         // ↓ — focus Remove
+            confirmDeleteFocusIndex = 1
+            return true
+        case 36, 49:      // Enter / Space — execute focused button
+            if confirmDeleteFocusIndex == 1, let station = confirmDeleteStation {
+                allStationsState.removeFavorite(station)
+                if selectedIndex >= allStationsState.favoriteStations.count {
+                    selectedIndex = max(0, allStationsState.favoriteStations.count - 1)
+                }
+            }
+            confirmDeleteStation = nil
+            return true
+        default:
+            return true   // Trap all keys — modal is fully isolated
         }
     }
 
@@ -2927,6 +3176,129 @@ struct ContentView: View {
             let mixed = raw[i] * (1 - settings.uniformity) + avg * settings.uniformity
             displayAmplitudes[i] += (mixed - displayAmplitudes[i]) * (1 - settings.smoothness)
         }
+    }
+
+    // MARK: - Context Menu Overlay
+
+    @ViewBuilder
+    private var contextMenuOverlay: some View {
+        if let station = contextMenuStation {
+            VStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(station.name)
+                        .font(terminalFont)
+                        .foregroundColor(.white.opacity(0.55))
+                        .lineLimit(1)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 10)
+                        .padding(.bottom, 6)
+                    ThinDivider()
+                    contextMenuItemView(label: "Play", index: 0)
+                    contextMenuItemView(
+                        label: allStationsState.localFavorites.contains(station.id)
+                            ? "Remove Favorite" : "Add Favorite",
+                        index: 1
+                    )
+                    contextMenuItemView(label: "Close", index: 2)
+                }
+                .background(Color(red: 0.10, green: 0.10, blue: 0.10))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .shadow(color: .black.opacity(0.5), radius: 16, x: 0, y: -6)
+                .padding(.horizontal, 8)
+                .padding(.bottom, 8)
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Context menu for \(station.name)")
+        }
+    }
+
+    private func contextMenuItemView(label: String, index: Int) -> some View {
+        HStack {
+            Text(label)
+                .font(terminalFont)
+                .foregroundColor(.white)
+            Spacer()
+            if index == contextMenuFocusIndex {
+                Text(">")
+                    .font(terminalFont)
+                    .foregroundColor(.accentColor)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(index == contextMenuFocusIndex ? Color.accentColor.opacity(0.15) : Color.clear)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            contextMenuFocusIndex = index
+            if index == 2 { contextMenuStation = nil } else { executeContextMenuAction() }
+        }
+        .accessibilityRole(.button)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(index == contextMenuFocusIndex ? [.isSelected, .isButton] : .isButton)
+    }
+
+    // MARK: - Confirm Delete Overlay
+
+    @ViewBuilder
+    private var confirmDeleteOverlay: some View {
+        if let station = confirmDeleteStation {
+            ZStack {
+                Color.black.opacity(0.55)
+                VStack(spacing: 14) {
+                    Text("Remove Station?")
+                        .font(terminalFont)
+                        .foregroundColor(.white)
+                    Text(station.name)
+                        .font(terminalFont)
+                        .foregroundColor(.white.opacity(0.65))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 16)
+                    HStack(spacing: 20) {
+                        deleteConfirmButton("Cancel", isFocused: confirmDeleteFocusIndex == 0) {
+                            confirmDeleteStation = nil
+                        }
+                        deleteConfirmButton("Remove", isFocused: confirmDeleteFocusIndex == 1) {
+                            allStationsState.removeFavorite(station)
+                            if selectedIndex >= allStationsState.favoriteStations.count {
+                                selectedIndex = max(0, allStationsState.favoriteStations.count - 1)
+                            }
+                            confirmDeleteStation = nil
+                        }
+                    }
+                }
+                .padding(20)
+                .background(panelBG)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.5), radius: 20, x: 0, y: 0)
+                .frame(maxWidth: 250)
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Confirm remove \(station.name) from favorites")
+        }
+    }
+
+    private func deleteConfirmButton(_ label: String, isFocused: Bool, action: @escaping () -> Void) -> some View {
+        Text(label)
+            .font(terminalFont)
+            .foregroundColor(.white)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 7)
+            .background(isFocused ? Color.accentColor.opacity(0.25) : Color.white.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .stroke(isFocused ? Color.accentColor : Color.clear, lineWidth: 1.5)
+            )
+            .contentShape(Rectangle())
+            .onTapGesture { action() }
+            .accessibilityRole(.button)
+            .accessibilityLabel(label)
+            .accessibilityAddTraits(isFocused ? [.isSelected, .isButton] : .isButton)
     }
 }
 
