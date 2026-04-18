@@ -2062,13 +2062,15 @@ struct TerminalStationRow: View {
                     .font(terminalFont)
                     .foregroundColor(isPlaying ? Color(red: 0.98, green: 0.25, blue: 0.65) : .white)
                     .lineLimit(1)
+                    .truncationMode(.tail)
             }
+            .layoutPriority(0)
             .animation(pushSpring, value: isSelected)
             .animation(.easeOut(duration: 0.15), value: isPlaying)
 
             let metaStr = station.metadataDisplayString
             if !metaStr.isEmpty {
-                Spacer().frame(width: 8)
+                Spacer(minLength: 8)
                 MarqueeText(
                     text: metaStr,
                     font: terminalFont,
@@ -2078,6 +2080,8 @@ struct TerminalStationRow: View {
                     startDelay: 1.0,
                     cycleDelay: 1.0
                 )
+                .frame(minWidth: 60, alignment: .leading)
+                .layoutPriority(1)
                 .animation(pushSpring, value: isSelected)
             }
         }
@@ -2383,17 +2387,19 @@ struct AllStationsStationRow: View {
                         .fill(textColor)
                         .frame(width: 7, height: 8)
                 }
-                
+
                 Text(station.name)
                     .font(terminalFont)
                     .foregroundColor(isPlaying ? Color(red: 0.98, green: 0.25, blue: 0.65) : textColor)
                     .lineLimit(1)
+                    .truncationMode(.tail)
             }
+            .layoutPriority(0)
             .animation(pushSpring, value: isSelected)
 
             let metaStr = station.metadataDisplayString
             if !metaStr.isEmpty {
-                Spacer().frame(width: 8)
+                Spacer(minLength: 8)
                 MarqueeText(
                     text: metaStr,
                     font: terminalFont,
@@ -2403,6 +2409,8 @@ struct AllStationsStationRow: View {
                     startDelay: 1.0,
                     cycleDelay: 1.0
                 )
+                .frame(minWidth: 60, alignment: .leading)
+                .layoutPriority(1)
                 .animation(pushSpring, value: isSelected)
             }
         }
@@ -2520,6 +2528,8 @@ struct AllStationsView: View {
                     .font(terminalFont)
                     .foregroundColor(textColor)
                     .lineLimit(1)
+                    .truncationMode(.head)
+                    .layoutPriority(0)
             }
 
             // Blinking Line Cursor (Figma 1294:2686 & UX Audit 5B)
@@ -2527,9 +2537,16 @@ struct AllStationsView: View {
                 .fill(textColor)
                 .frame(width: 1, height: 10)
                 .opacity(cursorVisible ? 1 : 0)
+                .layoutPriority(1)
                 .onAppear {
+                    cursorVisible = true
                     withAnimation(Animation.linear(duration: 0.5).repeatForever(autoreverses: true)) {
                         cursorVisible = false
+                    }
+                }
+                .onDisappear {
+                    withAnimation(.linear(duration: 0)) {
+                        cursorVisible = true
                     }
                 }
 
@@ -2538,7 +2555,10 @@ struct AllStationsView: View {
                     .font(terminalFont)
                     .foregroundColor(textColor.opacity(0.5))
                     .lineLimit(1)
+                    .truncationMode(.tail)
             }
+
+            Spacer(minLength: 0)
         }
         // Pulsing underline = network activity. Stays invisible when idle, fades
         // back to transparent on completion so it shares the established 0.3s
@@ -3075,7 +3095,10 @@ struct ContentView: View {
                 .frame(width: outerGeo.size.width, height: viewportH, alignment: .topLeading)
                 .clipped()
                 .onChange(of: selectedIndex) { newIdx in
-                    favoritesScroll.scrollToIndex(newIdx, totalItems: allStationsState.favoriteStations.count)
+                    // Skip the virtual "All Stations" link index (rendered outside this scroll region).
+                    let count = allStationsState.favoriteStations.count
+                    guard count > 0, newIdx < count else { return }
+                    favoritesScroll.scrollToIndex(newIdx, totalItems: count)
                 }
                 .onChange(of: allStationsState.favoriteStations.count) { count in
                     favoritesScroll.updateItemCount(count)
@@ -3169,10 +3192,10 @@ struct ContentView: View {
                 .frame(width: outerGeo.size.width, height: viewportH, alignment: .topLeading)
                 .clipped()
                 .onChange(of: selectedIndex) { newIdx in
-                    recentsScroll.scrollToIndex(
-                        newIdx,
-                        totalItems: allStationsState.recentStations.count
-                    )
+                    // Skip when focus is on the virtual "All Stations" link.
+                    let count = allStationsState.recentStations.count
+                    guard count > 0, newIdx < count else { return }
+                    recentsScroll.scrollToIndex(newIdx, totalItems: count)
                 }
                 .onChange(of: allStationsState.recentStations.count) { count in
                     recentsScroll.updateItemCount(count)
@@ -3777,6 +3800,8 @@ struct ContentView: View {
                         .font(terminalFont)
                         .foregroundColor(.white.opacity(0.55))
                         .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 12)
                         .padding(.top, 10)
                         .padding(.bottom, 6)
