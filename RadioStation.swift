@@ -2563,7 +2563,7 @@ struct AllStationsView: View {
             }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityRole(.searchField)
+        .accessibilityAddTraits(.isSearchField)
         .accessibilityLabel("Search stations")
         .accessibilityValue(state.searchText)
         .accessibilityHint("Type name, country, or genre. Down arrow moves to results. Escape clears.")
