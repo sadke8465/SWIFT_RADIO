@@ -2790,6 +2790,7 @@ struct ContentView: View {
     @StateObject private var radio    = RadioBrowserService()
     @StateObject private var keyboard = KeyboardEventHandler()
     @StateObject private var allStationsState = AllStationsState()
+    @ObservedObject private var appSettings = AppSettings.shared
 
     @State private var displayAmplitudes: [CGFloat] = Array(repeating: 0, count: 6)
     @State private var selectedIndex: Int = 0
@@ -2842,14 +2843,24 @@ struct ContentView: View {
             // Content area — in-place cross-fade (Liquid Glass §3 Portals)
             ZStack {
                 // ─── Default: Visualizer + Favorites ───
+                // When the user disables the visualizer (Settings → Behavior),
+                // the Favorites/Recents section absorbs the freed vertical space
+                // so the panel stays visually balanced rather than leaving a gap.
                 if !showAllStations {
                     VStack(spacing: 4) {
-                        visualizerSection
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        favoritesSection
-                            .fixedSize(horizontal: false, vertical: true)
+                        if appSettings.showVisualizer {
+                            visualizerSection
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                            favoritesSection
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            favoritesSection
+                                .frame(maxHeight: .infinity)
+                        }
                     }
                     .frame(maxHeight: .infinity)
+                    .animation(portalCurve, value: appSettings.showVisualizer)
                     .transition(.opacity)
                 }
 
@@ -3030,7 +3041,7 @@ struct ContentView: View {
                     .foregroundColor(.white.opacity(0.4))
                 Spacer()
             }
-            .frame(height: 96)
+            .frame(minHeight: 96, maxHeight: appSettings.showVisualizer ? 96 : .infinity)
         } else {
             GeometryReader { outerGeo in
                 let viewportH = outerGeo.size.height
@@ -3082,7 +3093,7 @@ struct ContentView: View {
                     favoritesScroll.jumpToTop()
                 }
             }
-            .frame(height: 96)
+            .frame(minHeight: 96, maxHeight: appSettings.showVisualizer ? 96 : .infinity)
         }
     }
 
@@ -3124,7 +3135,7 @@ struct ContentView: View {
                     .foregroundColor(.white.opacity(0.4))
                 Spacer()
             }
-            .frame(height: 96)
+            .frame(minHeight: 96, maxHeight: appSettings.showVisualizer ? 96 : .infinity)
         } else {
             GeometryReader { outerGeo in
                 let viewportH = outerGeo.size.height
@@ -3179,7 +3190,7 @@ struct ContentView: View {
                     recentsScroll.jumpToTop()
                 }
             }
-            .frame(height: 96)
+            .frame(minHeight: 96, maxHeight: appSettings.showVisualizer ? 96 : .infinity)
         }
     }
 
@@ -4024,6 +4035,9 @@ final class AppSettings: ObservableObject {
     @Published var showDockIcon: Bool = true { didSet { persist() } }
     /// Auto-play the most-recent station on next launch.
     @Published var autoResumeOnLaunch: Bool = false { didSet { persist() } }
+    /// Whether the frequency-spectrum visualizer is shown in the main panel.
+    /// When off, the Favorites/Recents list expands into the freed space.
+    @Published var showVisualizer: Bool = true { didSet { persist() } }
 
     private struct Payload: Codable {
         var enabledGenres: [GenreOption]
@@ -4034,6 +4048,7 @@ final class AppSettings: ObservableObject {
         var showMenuBarIcon: Bool
         var showDockIcon: Bool
         var autoResumeOnLaunch: Bool
+        var showVisualizer: Bool?
     }
 
     private static let storageKey = "SwiftRadio.AppSettings.v1"
@@ -4057,6 +4072,7 @@ final class AppSettings: ObservableObject {
         showMenuBarIcon    = payload.showMenuBarIcon
         showDockIcon       = payload.showDockIcon
         autoResumeOnLaunch = payload.autoResumeOnLaunch
+        showVisualizer     = payload.showVisualizer ?? true
         isLoading = false
     }
 
@@ -4070,7 +4086,8 @@ final class AppSettings: ObservableObject {
             maxRecents: maxRecents,
             showMenuBarIcon: showMenuBarIcon,
             showDockIcon: showDockIcon,
-            autoResumeOnLaunch: autoResumeOnLaunch
+            autoResumeOnLaunch: autoResumeOnLaunch,
+            showVisualizer: showVisualizer
         )
         if let data = try? JSONEncoder().encode(payload) {
             UserDefaults.standard.set(data, forKey: Self.storageKey)
@@ -4448,6 +4465,8 @@ struct SettingsView: View {
 
     private var behaviorSection: some View {
         VStack(alignment: .leading, spacing: 10) {
+            Toggle("Show visualizer", isOn: $settings.showVisualizer)
+                .font(.system(size: 12))
             Toggle("Show menu-bar icon", isOn: $settings.showMenuBarIcon)
                 .font(.system(size: 12))
             Toggle("Show Dock icon", isOn: $settings.showDockIcon)
