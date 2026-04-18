@@ -158,6 +158,12 @@ Press **`V`** to cycle through three built-in presets:
 | **Fixed Grow** | Static grow with strong radius scaling — circles swell in place |
 | **Kinetic Weave** | Weighted sizing without uniform scaling — individual band motion |
 
+### Hiding the visualizer
+
+Open the menu-bar **Settings…** panel (`⌘,`) and toggle **Show visualizer** off
+under *Behavior*. The Favorites/Recents list smoothly expands to fill the
+freed space, so the panel keeps its shape instead of leaving a gap.
+
 ---
 
 ## Tweak Panel (Advanced)
