@@ -1526,6 +1526,7 @@ enum ResponderZone: Equatable {
     case search         // All Stations search bar is receiving input
     case contextMenu    // Station context popup is open
     case confirmDelete  // Destructive-action confirmation sheet is open
+    case onboarding     // First-run / on-demand keyboard shortcut overlay
 }
 
 // MARK: - Thin Divider (matches Figma)
@@ -2827,10 +2828,17 @@ struct ContentView: View {
     // Shake feedback on invalid actions (HIG: password-field rejection)
     @State private var invalidActionShake: Int = 0
 
+    // Onboarding: shown once on first launch and on-demand via `?`.
+    // Bumped storage key whenever the sheet's content changes meaningfully so
+    // returning users see the updated shortcut set.
+    @AppStorage("hasSeenOnboardingV1") private var hasSeenOnboarding: Bool = false
+    @State private var showOnboarding: Bool = false
+
     /// Computed responder zone — derived from existing state, no extra @State needed.
     private var currentZone: ResponderZone {
         if contextMenuStation != nil { return .contextMenu }
         if confirmDeleteStation != nil { return .confirmDelete }
+        if showOnboarding { return .onboarding }
         if showAllStations { return allStationsState.isSearching ? .search : .browse }
         return .home
     }
@@ -2891,6 +2899,7 @@ struct ContentView: View {
         .fixedSize()
         .overlay(alignment: .bottom) { contextMenuOverlay }
         .overlay { confirmDeleteOverlay }
+        .overlay { onboardingOverlay }
         .onReceive(frameTimer) { _ in
             updateVisuals()
         }
@@ -2908,6 +2917,13 @@ struct ContentView: View {
                 if let station = allStationsState.recentStations.first
                     ?? allStationsState.favoriteStations.first {
                     audio.playStation(station)
+                }
+            }
+
+            // First-launch shortcut cheatsheet. `?` re-summons it any time.
+            if !hasSeenOnboarding {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    withAnimation(portalCurve) { showOnboarding = true }
                 }
             }
         }
@@ -3228,6 +3244,7 @@ struct ContentView: View {
             switch currentZone {
             case .contextMenu:    return handleContextMenuKey(event)
             case .confirmDelete:  return handleConfirmDeleteKey(event)
+            case .onboarding:     return handleOnboardingKey(event)
             case .search:         return handleSearchKey(event)
             case .browse:         return handleAllStationsNavKey(event)
             case .home:           return handleHomeKey(event)
@@ -3372,6 +3389,9 @@ struct ContentView: View {
             return true
         case 3 where cmd:     // Cmd+F
             enterAllStations(); openSearch()
+            return true
+        case 44 where shift:  // ? (Shift+/) — open shortcut cheatsheet
+            openOnboarding()
             return true
         case 44 where !cmd:   // /
             enterAllStations(); openSearch()
@@ -3582,6 +3602,9 @@ struct ContentView: View {
         case 3 where cmd:     // Cmd+F
             openSearch()
             return true
+        case 44 where shift:  // ? (Shift+/) — open shortcut cheatsheet
+            openOnboarding()
+            return true
         case 44 where !cmd:   // /
             openSearch()
             return true
@@ -3675,6 +3698,26 @@ struct ContentView: View {
         default: break
         }
         contextMenuStation = nil
+    }
+
+    // MARK: - Onboarding Key Handler (any key dismisses)
+
+    private func openOnboarding() {
+        withAnimation(portalCurve) { showOnboarding = true }
+    }
+
+    private func dismissOnboarding() {
+        withAnimation(portalCurve) { showOnboarding = false }
+        hasSeenOnboarding = true
+    }
+
+    private func handleOnboardingKey(_ event: NSEvent) -> Bool {
+        // Modifier-only presses (e.g. holding Shift) shouldn't dismiss — only real
+        // characters or navigation keys should. keyCodes 54..63 are the modifier keys.
+        let modifierKeyCodes: Set<UInt16> = [54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
+        if modifierKeyCodes.contains(event.keyCode) { return true }
+        dismissOnboarding()
+        return true
     }
 
     // MARK: - Confirm Delete Key Handler (focus trapped inside dialog)
@@ -3848,6 +3891,92 @@ struct ContentView: View {
         .accessibilityRole(.button)
         .accessibilityLabel(label)
         .accessibilityAddTraits(index == contextMenuFocusIndex ? [.isSelected, .isButton] : .isButton)
+    }
+
+    // MARK: - Onboarding Overlay (first-launch + `?` cheatsheet)
+
+    @ViewBuilder
+    private var onboardingOverlay: some View {
+        if showOnboarding {
+            ZStack {
+                Color.black.opacity(0.7)
+                    .contentShape(Rectangle())
+                    .onTapGesture { dismissOnboarding() }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Shortcuts")
+                            .font(terminalFont)
+                            .foregroundColor(.white)
+                        Spacer()
+                        Text("esc")
+                            .font(terminalFont)
+                            .foregroundColor(.white.opacity(0.4))
+                    }
+                    ThinDivider()
+
+                    onboardingGroup("Playback", rows: [
+                        ("Space",   "Play / Pause"),
+                        ("← →",     "Panel / Genre"),
+                        ("⇧ ← →",   "Prev / Next station"),
+                    ])
+                    onboardingGroup("Navigate", rows: [
+                        ("↑ ↓",     "Move selection"),
+                        ("↵",       "Play"),
+                        ("⌘ [  ⌘ ]", "Home / All Stations"),
+                    ])
+                    onboardingGroup("Discover", rows: [
+                        ("⌘ K  /",  "Search anywhere"),
+                        ("F",       "Toggle favorite"),
+                        ("M",       "Context menu"),
+                    ])
+                    onboardingGroup("App", rows: [
+                        ("V",       "Visualizer preset"),
+                        ("D",       "Tweak panel"),
+                        ("?",       "Show this help"),
+                    ])
+
+                    ThinDivider()
+                    Text("Press any key to dismiss")
+                        .font(terminalFont)
+                        .foregroundColor(.white.opacity(0.45))
+                        .frame(maxWidth: .infinity, alignment: .center)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+                .background(panelBG)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.5), radius: 20, x: 0, y: 0)
+                .padding(.horizontal, 10)
+            }
+            .transition(.opacity)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Keyboard shortcuts")
+        }
+    }
+
+    private func onboardingGroup(_ title: String, rows: [(String, String)]) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title.uppercased())
+                .font(terminalFont)
+                .foregroundColor(Color.cyan.opacity(0.75))
+            ForEach(rows, id: \.0) { key, desc in
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(key)
+                        .font(terminalFont)
+                        .foregroundColor(.white)
+                        .frame(width: 82, alignment: .leading)
+                    Text(desc)
+                        .font(terminalFont)
+                        .foregroundColor(.white.opacity(0.7))
+                    Spacer(minLength: 0)
+                }
+            }
+        }
     }
 
     // MARK: - Confirm Delete Overlay
