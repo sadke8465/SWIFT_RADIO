@@ -45,6 +45,9 @@ The visualizer below the transport shows a 6-band frequency spectrum that reacts
 | `Space` | Toggle play / pause |
 | `V` | Cycle visualizer preset |
 | `D` | Toggle the debug/tweak panel |
+| `?` | Show the keyboard shortcut cheatsheet |
+
+The cheatsheet also appears automatically on first launch and can be dismissed with any key (or a click outside the panel).
 
 ### Home Panel (Favorites & Recents)
 
