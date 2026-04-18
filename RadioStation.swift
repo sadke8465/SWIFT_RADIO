@@ -158,6 +158,141 @@ class RadioBrowserService: ObservableObject {
     }
 }
 
+// MARK: - Radio Browser Query (intelligent multi-param search)
+
+/// Structured query assembled by `RadioQueryParser` from a free-form input string.
+/// Maps directly to the Radio Browser `/stations/search` endpoint parameters:
+/// https://de1.api.radio-browser.info/
+struct RadioBrowserQuery {
+    var name: String = ""
+    var countryCode: String = ""   // ISO-3166-1 alpha-2 (preferred over `country`)
+    var country: String = ""       // Full country name — used only if ISO code is unknown
+    var state: String = ""
+    var tags: [String] = []
+
+    var isEmpty: Bool {
+        name.isEmpty && countryCode.isEmpty && country.isEmpty && state.isEmpty && tags.isEmpty
+    }
+
+    func urlQueryItems(limit: Int) -> [URLQueryItem] {
+        var items: [URLQueryItem] = [
+            URLQueryItem(name: "limit",       value: String(limit)),
+            URLQueryItem(name: "hidebroken",  value: "true"),
+            URLQueryItem(name: "order",       value: "votes"),
+            URLQueryItem(name: "reverse",     value: "true"),
+        ]
+        if !name.isEmpty           { items.append(URLQueryItem(name: "name",        value: name)) }
+        if !countryCode.isEmpty    { items.append(URLQueryItem(name: "countrycode", value: countryCode)) }
+        else if !country.isEmpty   { items.append(URLQueryItem(name: "country",     value: country)) }
+        if !state.isEmpty          { items.append(URLQueryItem(name: "state",       value: state)) }
+        if tags.count == 1         { items.append(URLQueryItem(name: "tag",         value: tags[0])) }
+        else if tags.count > 1     { items.append(URLQueryItem(name: "tagList",     value: tags.joined(separator: ","))) }
+        return items
+    }
+}
+
+/// Parses a free-form input ("Jazz Israel", "United States NPR", "KAN GIMEL") into a
+/// `RadioBrowserQuery`. Recognizes:
+///   • A curated country phrase list → ISO country code
+///   • A curated tag/genre vocabulary → `tag`/`tagList`
+///   • Everything left over → `name` (station title match)
+///
+/// The parser is deliberately conservative: unknown tokens always fall through to
+/// `name` so unusual station titles ("KAN GIMEL") still resolve cleanly.
+enum RadioQueryParser {
+    /// Country phrase → ISO-3166-1 alpha-2. Keys must be lowercase.
+    /// Ordered longest-first at match time, so "united kingdom" wins over "united".
+    private static let countryPhrases: [String: String] = [
+        // The Americas
+        "united states": "US", "united states of america": "US", "usa": "US", "us": "US", "america": "US",
+        "canada": "CA", "mexico": "MX", "brazil": "BR", "argentina": "AR", "chile": "CL",
+        "colombia": "CO", "peru": "PE", "venezuela": "VE", "cuba": "CU",
+        // Europe
+        "united kingdom": "GB", "uk": "GB", "great britain": "GB", "britain": "GB",
+        "england": "GB", "scotland": "GB", "wales": "GB",
+        "ireland": "IE", "france": "FR", "germany": "DE", "spain": "ES", "italy": "IT",
+        "portugal": "PT", "netherlands": "NL", "holland": "NL", "belgium": "BE",
+        "switzerland": "CH", "austria": "AT", "sweden": "SE", "norway": "NO",
+        "denmark": "DK", "finland": "FI", "poland": "PL", "czech republic": "CZ",
+        "czechia": "CZ", "hungary": "HU", "greece": "GR", "romania": "RO",
+        "ukraine": "UA", "russia": "RU", "iceland": "IS",
+        // Middle East & Africa
+        "israel": "IL", "palestine": "PS", "turkey": "TR", "egypt": "EG",
+        "saudi arabia": "SA", "united arab emirates": "AE", "uae": "AE",
+        "south africa": "ZA", "morocco": "MA", "nigeria": "NG", "kenya": "KE",
+        // Asia & Pacific
+        "japan": "JP", "china": "CN", "south korea": "KR", "korea": "KR",
+        "india": "IN", "pakistan": "PK", "indonesia": "ID", "philippines": "PH",
+        "thailand": "TH", "vietnam": "VN", "malaysia": "MY", "singapore": "SG",
+        "hong kong": "HK", "taiwan": "TW",
+        "australia": "AU", "new zealand": "NZ",
+    ]
+
+    /// Genre/format keywords recognized as explicit tags. Lowercase, no punctuation.
+    private static let knownTags: Set<String> = [
+        "jazz", "rock", "pop", "classical", "classic", "news", "talk", "sports",
+        "hiphop", "rap", "electronic", "edm", "house", "techno", "trance",
+        "ambient", "chill", "lounge", "country", "folk", "blues", "reggae",
+        "latin", "salsa", "dance", "indie", "alternative", "metal", "punk",
+        "soul", "funk", "oldies", "christian", "gospel", "religious", "kids",
+        "comedy", "culture", "public", "college", "community", "tech",
+        "business", "weather", "dnb", "dubstep", "disco", "bollywood", "kpop",
+        "anime", "workout", "80s", "90s", "70s", "60s", "2000s",
+    ]
+
+    /// Tokenizer: lowercases and splits on whitespace. Unicode scalars (CJK, emoji,
+    /// accents) pass through unchanged so unusual names route to `name=` intact.
+    private static func tokenize(_ s: String) -> [String] {
+        s.lowercased()
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+    }
+
+    static func parse(_ input: String) -> RadioBrowserQuery {
+        var tokens = tokenize(input)
+        var query = RadioBrowserQuery()
+
+        // 1) Country phrase match — try longest phrases first (up to 3 tokens).
+        let maxLen = min(3, tokens.count)
+        if maxLen >= 1 {
+            phraseLoop: for length in stride(from: maxLen, through: 1, by: -1) {
+                var i = 0
+                while i <= tokens.count - length {
+                    let phrase = tokens[i..<(i + length)].joined(separator: " ")
+                    if let code = countryPhrases[phrase] {
+                        query.countryCode = code
+                        tokens.removeSubrange(i..<(i + length))
+                        continue phraseLoop
+                    }
+                    i += 1
+                }
+            }
+        }
+
+        // 2) Tag match — extract known genre keywords.
+        var remaining: [String] = []
+        for t in tokens {
+            if knownTags.contains(t) {
+                if !query.tags.contains(t) { query.tags.append(t) }
+            } else {
+                remaining.append(t)
+            }
+        }
+
+        // 3) Leftovers → name. Preserve original casing for readability; the API
+        //    matches case-insensitively either way.
+        if !remaining.isEmpty {
+            let originalTokens = input.components(separatedBy: .whitespacesAndNewlines)
+                .filter { !$0.isEmpty }
+            let remainingSet = Set(remaining)
+            let kept = originalTokens.filter { remainingSet.contains($0.lowercased()) }
+            query.name = kept.joined(separator: " ")
+        }
+
+        return query
+    }
+}
+
 // MARK: - All Stations State
 
 @MainActor
@@ -175,6 +310,17 @@ class AllStationsState: ObservableObject {
     @Published var isLoading = false
     @Published var currentStations: [RadioStation] = []
 
+    /// Results from the most recent Radio Browser API search. Empty while no query is
+    /// active; overrides `currentStations` in `filteredStations` whenever `searchText`
+    /// is non-empty.
+    @Published var searchResults: [RadioStation] = []
+    /// True while a debounced API search is in flight — drives the pulsing border on
+    /// the search palette.
+    @Published var isSearchLoading = false
+    /// Non-nil when the last search surfaced no results (or the network failed).
+    /// Shown in the empty state of the palette.
+    @Published var searchNotice: String?
+
     var localFavorites: Set<String> {
         Set(favoriteStations.map { $0.id })
     }
@@ -184,6 +330,14 @@ class AllStationsState: ObservableObject {
     private let favoritesKey = "savedFavoriteStations"
     private let recentsKey = "savedRecentStations"
     private let lastGenreKey = "lastSelectedGenreIndex"
+
+    /// Debounce + cancellation plumbing for the global search palette.
+    /// A 300ms delay after the final keystroke keeps us well under the API rate
+    /// limits; each new keystroke cancels any in-flight fetch so stale results
+    /// never flash in the UI.
+    private var searchCancellables: Set<AnyCancellable> = []
+    private var searchTask: Task<Void, Never>?
+    private static let searchResultLimit = 100
 
     init() {
         if let data = UserDefaults.standard.data(forKey: "savedFavoriteStations"),
@@ -201,19 +355,97 @@ class AllStationsState: ObservableObject {
             selectedGenreIndex = savedGenre
             previousGenreIndex = savedGenre
         }
+
+        // Debounced pipeline: every keystroke bumps `searchText`, we wait 300ms of
+        // silence, then fire an async API search. `removeDuplicates` prevents a
+        // duplicate fetch when the state is cleared + reset to the same value.
+        $searchText
+            .removeDuplicates()
+            .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
+            .sink { [weak self] text in
+                self?.performSearch(text)
+            }
+            .store(in: &searchCancellables)
     }
 
     var filteredStations: [RadioStation] {
-        // Filter whenever text is present — isSearching only controls the search bar UI.
-        // Matches across name, tags, country, codec, bitrate (matches README contract).
+        // With a live query the palette renders remote API results; otherwise the
+        // selected genre's cached list wins. `searchText` (not `isSearching`) is the
+        // source of truth so filtering persists after ↓ transfers focus to the list.
         let q = searchText.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return currentStations }
-        return currentStations.filter { s in
-            s.name.localizedCaseInsensitiveContains(q)
-                || s.tags.localizedCaseInsensitiveContains(q)
-                || s.country.localizedCaseInsensitiveContains(q)
-                || s.codec.localizedCaseInsensitiveContains(q)
-                || String(s.bitrate).contains(q)
+        return searchResults
+    }
+
+    /// Debounced entry point — cancels the previous fetch and kicks off a new one
+    /// matching the parsed query. Empty/whitespace input clears the results.
+    private func performSearch(_ rawText: String) {
+        searchTask?.cancel()
+
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            searchResults = []
+            isSearchLoading = false
+            searchNotice = nil
+            return
+        }
+
+        let query = RadioQueryParser.parse(text)
+        guard !query.isEmpty else {
+            // Shouldn't happen — parser routes unknown tokens to `name` — but defend anyway.
+            searchResults = []
+            isSearchLoading = false
+            searchNotice = nil
+            return
+        }
+
+        isSearchLoading = true
+        searchNotice = nil
+        let limit = Self.searchResultLimit
+        let baseURL = self.baseURL
+
+        searchTask = Task { [weak self] in
+            let outcome = await Self.fetchSearch(query: query, baseURL: baseURL, limit: limit)
+            if Task.isCancelled { return }
+            guard let self = self else { return }
+            switch outcome {
+            case .success(let stations):
+                self.searchResults = stations
+                self.searchNotice = stations.isEmpty ? "No stations found" : nil
+            case .failure:
+                self.searchResults = []
+                self.searchNotice = "Search unavailable"
+            }
+            self.isSearchLoading = false
+            self.selectedStationIndex = 0
+        }
+    }
+
+    /// Off-main-actor network call. Using `URLComponents` lets us compose multiple
+    /// query parameters without hand-rolling percent-encoding for every field.
+    nonisolated private static func fetchSearch(
+        query: RadioBrowserQuery,
+        baseURL: String,
+        limit: Int
+    ) async -> Result<[RadioStation], Error> {
+        guard var comps = URLComponents(string: "\(baseURL)/stations/search") else {
+            return .success([])
+        }
+        comps.queryItems = query.urlQueryItems(limit: limit)
+        guard let url = comps.url else { return .success([]) }
+        var req = URLRequest(url: url)
+        req.setValue("RadioVisualizerApp/1.0", forHTTPHeaderField: "User-Agent")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                return .success([])
+            }
+            let stations = try JSONDecoder().decode([RadioStation].self, from: data)
+            return .success(stations)
+        } catch is CancellationError {
+            return .success([])   // cancelled — discard result, caller already bailed
+        } catch {
+            return .failure(error)
         }
     }
 
@@ -322,6 +554,11 @@ class AllStationsState: ObservableObject {
         genreCache = [:]
         currentStations = []
         isLoading = false
+        searchTask?.cancel()
+        searchTask = nil
+        searchResults = []
+        isSearchLoading = false
+        searchNotice = nil
     }
 
     func toggleFavorite() {
@@ -2141,6 +2378,10 @@ struct AllStationsView: View {
     private let searchSpring = Animation.timingCurve(0.15, 0, 0, 1, duration: 0.3)
     
     @State private var cursorVisible = true
+    /// Pulses between high/low opacity while a search is in flight — ties the
+    /// network state to the existing motion language rather than adding a
+    /// separate spinner chrome.
+    @State private var loadingPulse: Bool = false
 
     // Spatial Shift transition: whole list slides in the direction of navigation
     private var genreTransition: AnyTransition {
@@ -2185,7 +2426,10 @@ struct AllStationsView: View {
     /// Treated as one opaque block so the entire thing swipes together.
     @ViewBuilder
     private var contentForCurrentGenre: some View {
-        if state.isLoading {
+        // Show the spinner for either kind of load (genre prefetch *or* remote
+        // search). The search pulse handles the search-specific feedback inside
+        // the palette; this surface remains visibly busy until results arrive.
+        if state.isLoading || state.isSearchLoading {
             loadingView
         } else if state.filteredStations.isEmpty {
             emptyView
@@ -2215,17 +2459,39 @@ struct AllStationsView: View {
                 }
 
             if state.searchText.isEmpty {
-                Text("Search")
+                Text("Name, country, genre…")
                     .font(terminalFont)
                     .foregroundColor(textColor.opacity(0.5))
                     .lineLimit(1)
+            }
+        }
+        // Pulsing underline = network activity. Stays invisible when idle, fades
+        // back to transparent on completion so it shares the established 0.3s
+        // Spatial-Shift cadence.
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(textColor)
+                .frame(height: 1)
+                .opacity(state.isSearchLoading ? (loadingPulse ? 0.55 : 0.12) : 0.0)
+                .offset(y: 6)
+        }
+        .onChange(of: state.isSearchLoading) { loading in
+            if loading {
+                loadingPulse = false
+                withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
+                    loadingPulse = true
+                }
+            } else {
+                withAnimation(.easeOut(duration: 0.25)) {
+                    loadingPulse = false
+                }
             }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityRole(.searchField)
         .accessibilityLabel("Search stations")
         .accessibilityValue(state.searchText)
-        .accessibilityHint("Type to filter. Down arrow moves to results. Escape clears.")
+        .accessibilityHint("Type name, country, or genre. Down arrow moves to results. Escape clears.")
     }
 
     private var genreBar: some View {
@@ -2272,19 +2538,27 @@ struct AllStationsView: View {
     /// empty list is due to a search filter or a genuinely empty catalog.
     private var emptyView: some View {
         let hasQuery = !state.searchText.trimmingCharacters(in: .whitespaces).isEmpty
+        let headline: String = {
+            if hasQuery { return state.searchNotice ?? "No stations found" }
+            return "No stations available"
+        }()
+        let subline: String = {
+            if hasQuery { return "Press Esc to refine your query" }
+            return "Try a different genre with ← →"
+        }()
         return VStack(spacing: 10) {
             Spacer()
             Image(systemName: hasQuery ? "magnifyingglass" : "antenna.radiowaves.left.and.right.slash")
                 .font(.system(size: 22, weight: .light))
                 .foregroundColor(textColor.opacity(0.5))
-            Text(hasQuery ? "No matches for “\(state.searchText)”" : "No stations available")
+            Text(headline)
                 .font(terminalFont)
                 .foregroundColor(textColor)
                 .lineLimit(2)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 16)
                 .fixedSize(horizontal: false, vertical: true)
-            Text(hasQuery ? "Press Esc to clear search" : "Try a different genre with ← →")
+            Text(subline)
                 .font(terminalFont)
                 .foregroundColor(textColor.opacity(0.5))
                 .lineLimit(1)
@@ -2292,7 +2566,7 @@ struct AllStationsView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(hasQuery ? "No matches for \(state.searchText). Press Escape to clear." : "No stations available. Try a different genre.")
+        .accessibilityLabel(hasQuery ? "\(headline). Press Escape to clear." : "No stations available. Try a different genre.")
     }
 
     @StateObject private var liquidScroll = LiquidScrollState()
@@ -2985,7 +3259,10 @@ struct ContentView: View {
             enterAllStations()
             return true
 
-        // ── Search activation (Cmd+F or /) ───────────────────────────
+        // ── Search activation (Cmd+K / Cmd+F / /) ────────────────────
+        case 40 where cmd:    // Cmd+K — global command palette
+            enterAllStations(); openSearch()
+            return true
         case 3 where cmd:     // Cmd+F
             enterAllStations(); openSearch()
             return true
@@ -3067,6 +3344,8 @@ struct ContentView: View {
             return true
 
         case 3 where cmd:     // Cmd+F — already searching; no-op
+            return true
+        case 40 where cmd:    // Cmd+K — already searching; no-op
             return true
 
         default:
@@ -3188,6 +3467,9 @@ struct ContentView: View {
 
         // ── Search activation ─────────────────────────────────────────
         case 1:               // S
+            openSearch()
+            return true
+        case 40 where cmd:    // Cmd+K — global command palette
             openSearch()
             return true
         case 3 where cmd:     // Cmd+F
