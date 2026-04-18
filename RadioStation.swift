@@ -297,8 +297,12 @@ enum RadioQueryParser {
 
 @MainActor
 class AllStationsState: ObservableObject {
-    let genres = ["All Stations", "News", "Jazz", "Rock"]
-    let countries = ["US", "GB", "IL"]
+    /// Genre tabs shown in the All Stations browser. "All Stations" is always index 0;
+    /// the rest come from `AppSettings.enabledGenres` and update live when Settings changes.
+    @Published var genres: [String] = ["All Stations", "News", "Jazz", "Rock"]
+    /// Countries biased when fetching the "All Stations" and per-genre lists.
+    /// Mirrored from `AppSettings.countryBias`.
+    @Published var countries: [String] = ["US", "GB", "IL"]
 
     @Published var selectedGenreIndex = 0
     @Published var previousGenreIndex = 0
@@ -350,11 +354,18 @@ class AllStationsState: ObservableObject {
            let stations = try? JSONDecoder().decode([RadioStation].self, from: data) {
             recentStations = stations
         }
+
+        // Seed the selected tab from UserDefaults first so that any prefetch kicked
+        // off by the upcoming `syncWithSettings` call hits the user's actual tab.
         let savedGenre = UserDefaults.standard.integer(forKey: lastGenreKey)
         if savedGenre >= 0 && savedGenre < genres.count {
             selectedGenreIndex = savedGenre
             previousGenreIndex = savedGenre
         }
+
+        // Pull the current user preferences for genres + country bias. This clamps
+        // the selected index if the saved tab no longer exists.
+        syncWithSettings(AppSettings.shared)
 
         // Debounced pipeline: every keystroke bumps `searchText`, we wait 300ms of
         // silence, then fire an async API search. `removeDuplicates` prevents a
@@ -366,6 +377,49 @@ class AllStationsState: ObservableObject {
                 self?.performSearch(text)
             }
             .store(in: &searchCancellables)
+
+        // Live-reload genre tabs + country bias when the Settings panel edits them.
+        // We collapse back to "All Stations" and dump the cache so the next genre
+        // fetch reflects the new country set.
+        AppSettings.shared.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                // Defer one tick so AppSettings' published properties are committed
+                // before we read them.
+                DispatchQueue.main.async { self?.syncWithSettings(AppSettings.shared) }
+            }
+            .store(in: &searchCancellables)
+    }
+
+    /// Copy the user-facing genre + country bias lists from `AppSettings` into this
+    /// state, and wipe cached station lists if either has changed — cached lists are
+    /// country-scoped and would otherwise be stale.
+    func syncWithSettings(_ settings: AppSettings) {
+        let newGenres = ["All Stations"] + settings.enabledGenres.map { $0.displayName }
+        let newCountries = settings.countryBias.isEmpty ? ["US"] : settings.countryBias
+
+        let genresChanged    = newGenres != genres
+        let countriesChanged = newCountries != countries
+
+        guard genresChanged || countriesChanged else { return }
+
+        genres    = newGenres
+        countries = newCountries
+
+        // Clamp selection into the new tab range.
+        if selectedGenreIndex >= genres.count {
+            selectedGenreIndex = 0
+            previousGenreIndex = 0
+            UserDefaults.standard.set(0, forKey: lastGenreKey)
+        }
+
+        // Country or genre membership changed — invalidate cache and refetch the
+        // currently-selected tab so the UI reflects the new bias immediately.
+        genreCache = [:]
+        currentStations = []
+        isLoading = true
+        let targetIndex = selectedGenreIndex
+        Task { await fetchGenre(for: targetIndex) }
     }
 
     var filteredStations: [RadioStation] {
@@ -474,10 +528,16 @@ class AllStationsState: ObservableObject {
         if index == 0 {
             stations = await fetchTopFromCountries(limitPerCountry: 17)
         } else {
-            let genre = genres[index].lowercased()
-            stations = await fetchGenreFromCountries(genre: genre, limitPerCountry: 10)
+            // Translate the display name back to the Radio Browser API tag. Falls
+            // back to a lowercased slug so hand-added genres still fetch something
+            // reasonable.
+            let display = genres[index]
+            let tag = GenreOption.allOptions
+                .first(where: { $0.displayName == display })?.tag
+                ?? display.lowercased()
+            stations = await fetchGenreFromCountries(genre: tag, limitPerCountry: 10)
         }
-        
+
         if selectedGenreIndex == index {
             genreCache[index] = stations
             currentStations = stations
@@ -488,10 +548,12 @@ class AllStationsState: ObservableObject {
     }
 
     private func fetchTopFromCountries(limitPerCountry: Int) async -> [RadioStation] {
+        let codec = codecFilter()
+        let minBitrate = AppSettings.shared.minBitrate
         var all: [RadioStation] = []
         await withTaskGroup(of: [RadioStation].self) { group in
             for country in countries {
-                group.addTask { await self.fetchStations(country: country, tag: nil, limit: limitPerCountry) }
+                group.addTask { await self.fetchStations(country: country, tag: nil, limit: limitPerCountry, codec: codec, minBitrate: minBitrate) }
             }
             for await batch in group { all.append(contentsOf: batch) }
         }
@@ -499,18 +561,30 @@ class AllStationsState: ObservableObject {
     }
 
     private func fetchGenreFromCountries(genre: String, limitPerCountry: Int) async -> [RadioStation] {
+        let codec = codecFilter()
+        let minBitrate = AppSettings.shared.minBitrate
         var all: [RadioStation] = []
         await withTaskGroup(of: [RadioStation].self) { group in
             for country in countries {
-                group.addTask { await self.fetchStations(country: country, tag: genre, limit: limitPerCountry) }
+                group.addTask { await self.fetchStations(country: country, tag: genre, limit: limitPerCountry, codec: codec, minBitrate: minBitrate) }
             }
             for await batch in group { all.append(contentsOf: batch) }
         }
         return deduplicate(all, limit: 30)
     }
 
-    nonisolated private func fetchStations(country: String, tag: String?, limit: Int) async -> [RadioStation] {
-        var urlStr = "\(baseURL)/stations/search?limit=\(limit)&hidebroken=true&order=votes&reverse=true&codec=MP3&bitrateMin=96&countrycode=\(country)"
+    /// Map the Settings codec preference to a Radio Browser API query value.
+    /// Returns `nil` when the user picked "Any" so we don't constrain the filter.
+    private func codecFilter() -> String? {
+        let choice = AppSettings.shared.preferredCodec
+        return (choice == "Any") ? nil : choice
+    }
+
+    nonisolated private func fetchStations(country: String, tag: String?, limit: Int, codec: String?, minBitrate: Int) async -> [RadioStation] {
+        var urlStr = "\(baseURL)/stations/search?limit=\(limit)&hidebroken=true&order=votes&reverse=true&bitrateMin=\(minBitrate)&countrycode=\(country)"
+        if let codec = codec, !codec.isEmpty {
+            urlStr += "&codec=\(codec)"
+        }
         if let tag = tag {
             let enc = tag.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? tag
             urlStr += "&tag=\(enc)"
@@ -593,8 +667,9 @@ class AllStationsState: ObservableObject {
     func addRecent(_ station: RadioStation) {
         recentStations.removeAll { $0.id == station.id }
         recentStations.insert(station, at: 0)
-        if recentStations.count > 20 {
-            recentStations = Array(recentStations.prefix(20))
+        let cap = max(1, AppSettings.shared.maxRecents)
+        if recentStations.count > cap {
+            recentStations = Array(recentStations.prefix(cap))
         }
         saveRecents()
     }
@@ -2802,13 +2877,22 @@ struct ContentView: View {
         .background(WindowAccessor())
         .onAppear {
             installKeyboard()
+            // Expose these to the menu-bar controller, which lives outside the SwiftUI
+            // scene and needs a handle to dispatch Play/Pause / Next / Previous.
+            AppEnvironment.shared.audio = audio
+            AppEnvironment.shared.stations = allStationsState
+
+            // Auto-resume the most-recent station on launch when the user opted in.
+            // First recent wins; if absent, fall back to the top favorite.
+            if AppSettings.shared.autoResumeOnLaunch, audio.currentStation == nil {
+                if let station = allStationsState.recentStations.first
+                    ?? allStationsState.favoriteStations.first {
+                    audio.playStation(station)
+                }
+            }
         }
         .onDisappear {
             keyboard.uninstall()
-        }
-        // HIG: Cmd+, → open Settings. Posted by the app's CommandGroup replacement.
-        .onReceive(NotificationCenter.default.publisher(for: .openSettingsRequested)) { _ in
-            debugPanel.toggle(settings: settings, audio: audio)
         }
     }
 
@@ -3829,17 +3913,627 @@ struct WindowAccessor: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
+// MARK: - Genre & Country Catalogs
+
+/// A single genre option the user can pin to the tab bar.
+/// `displayName` is what shows in the All Stations header; `tag` is the Radio Browser
+/// API tag we hit (often lowercase, hyphen-stripped).
+struct GenreOption: Identifiable, Hashable, Codable {
+    var id: String { tag }
+    let tag: String
+    let displayName: String
+
+    static let allOptions: [GenreOption] = [
+        GenreOption(tag: "news",        displayName: "News"),
+        GenreOption(tag: "talk",        displayName: "Talk"),
+        GenreOption(tag: "sports",      displayName: "Sports"),
+        GenreOption(tag: "jazz",        displayName: "Jazz"),
+        GenreOption(tag: "rock",        displayName: "Rock"),
+        GenreOption(tag: "pop",         displayName: "Pop"),
+        GenreOption(tag: "classical",   displayName: "Classical"),
+        GenreOption(tag: "electronic",  displayName: "Electronic"),
+        GenreOption(tag: "hiphop",      displayName: "Hip-Hop"),
+        GenreOption(tag: "country",     displayName: "Country"),
+        GenreOption(tag: "metal",       displayName: "Metal"),
+        GenreOption(tag: "reggae",      displayName: "Reggae"),
+        GenreOption(tag: "latin",       displayName: "Latin"),
+        GenreOption(tag: "blues",       displayName: "Blues"),
+        GenreOption(tag: "ambient",     displayName: "Ambient"),
+        GenreOption(tag: "folk",        displayName: "Folk"),
+        GenreOption(tag: "indie",       displayName: "Indie"),
+    ]
+
+    static let defaults: [GenreOption] = [
+        allOptions.first { $0.tag == "news" }!,
+        allOptions.first { $0.tag == "jazz" }!,
+        allOptions.first { $0.tag == "rock" }!,
+    ]
+}
+
+/// Curated country catalog — ISO-3166-1 alpha-2 codes paired with display names.
+/// Used by the Settings panel's country-bias picker. Keeping this narrow avoids a
+/// paralyzing 250-entry list; advanced users can still search any country via the
+/// global Cmd+K palette.
+struct CountryOption: Identifiable, Hashable {
+    var id: String { code }
+    let code: String
+    let name: String
+
+    static let catalog: [CountryOption] = [
+        CountryOption(code: "US", name: "United States"),
+        CountryOption(code: "GB", name: "United Kingdom"),
+        CountryOption(code: "IL", name: "Israel"),
+        CountryOption(code: "CA", name: "Canada"),
+        CountryOption(code: "FR", name: "France"),
+        CountryOption(code: "DE", name: "Germany"),
+        CountryOption(code: "IT", name: "Italy"),
+        CountryOption(code: "ES", name: "Spain"),
+        CountryOption(code: "NL", name: "Netherlands"),
+        CountryOption(code: "SE", name: "Sweden"),
+        CountryOption(code: "NO", name: "Norway"),
+        CountryOption(code: "DK", name: "Denmark"),
+        CountryOption(code: "IE", name: "Ireland"),
+        CountryOption(code: "PT", name: "Portugal"),
+        CountryOption(code: "PL", name: "Poland"),
+        CountryOption(code: "GR", name: "Greece"),
+        CountryOption(code: "JP", name: "Japan"),
+        CountryOption(code: "KR", name: "South Korea"),
+        CountryOption(code: "AU", name: "Australia"),
+        CountryOption(code: "NZ", name: "New Zealand"),
+        CountryOption(code: "BR", name: "Brazil"),
+        CountryOption(code: "MX", name: "Mexico"),
+        CountryOption(code: "AR", name: "Argentina"),
+        CountryOption(code: "IN", name: "India"),
+        CountryOption(code: "ZA", name: "South Africa"),
+    ]
+
+    static func name(for code: String) -> String {
+        catalog.first { $0.code == code }?.name ?? code
+    }
+}
+
+// MARK: - App Settings
+
+/// User preferences surfaced in the menu-bar Settings panel. Persists via
+/// `UserDefaults` as JSON; `@Published` updates fan out to `AllStationsState`,
+/// the menu-bar controller, and the Settings UI itself.
+final class AppSettings: ObservableObject {
+    /// Global shared instance — the menu-bar lives outside the SwiftUI scene and
+    /// needs a stable handle. `AllStationsState` also reads this directly to keep
+    /// genre tabs + country bias in sync.
+    static let shared = AppSettings()
+
+    /// Genre tabs the user has pinned (beyond the always-present "All Stations").
+    @Published var enabledGenres: [GenreOption] = GenreOption.defaults {
+        didSet { persist() }
+    }
+    /// ISO country codes used to bias All Stations + per-genre fetches.
+    @Published var countryBias: [String] = ["US", "GB", "IL"] {
+        didSet { persist() }
+    }
+    /// Minimum bitrate used when fetching lists. Radio Browser's `bitrateMin`.
+    @Published var minBitrate: Int = 96 { didSet { persist() } }
+    /// Codec preference: "MP3", "AAC", or "Any".
+    @Published var preferredCodec: String = "MP3" { didSet { persist() } }
+    /// Cap on the Recents list.
+    @Published var maxRecents: Int = 20 { didSet { persist() } }
+    /// Whether the menu-bar status item is visible.
+    @Published var showMenuBarIcon: Bool = true { didSet { persist() } }
+    /// Whether the Dock icon is visible. Toggling this flips the app's activation
+    /// policy at runtime (regular ↔ accessory).
+    @Published var showDockIcon: Bool = true { didSet { persist() } }
+    /// Auto-play the most-recent station on next launch.
+    @Published var autoResumeOnLaunch: Bool = false { didSet { persist() } }
+
+    private struct Payload: Codable {
+        var enabledGenres: [GenreOption]
+        var countryBias: [String]
+        var minBitrate: Int
+        var preferredCodec: String
+        var maxRecents: Int
+        var showMenuBarIcon: Bool
+        var showDockIcon: Bool
+        var autoResumeOnLaunch: Bool
+    }
+
+    private static let storageKey = "SwiftRadio.AppSettings.v1"
+    private var isLoading = false
+
+    private init() {
+        load()
+    }
+
+    private func load() {
+        guard
+            let data = UserDefaults.standard.data(forKey: Self.storageKey),
+            let payload = try? JSONDecoder().decode(Payload.self, from: data)
+        else { return }
+        isLoading = true
+        enabledGenres      = payload.enabledGenres
+        countryBias        = payload.countryBias
+        minBitrate         = payload.minBitrate
+        preferredCodec     = payload.preferredCodec
+        maxRecents         = payload.maxRecents
+        showMenuBarIcon    = payload.showMenuBarIcon
+        showDockIcon       = payload.showDockIcon
+        autoResumeOnLaunch = payload.autoResumeOnLaunch
+        isLoading = false
+    }
+
+    private func persist() {
+        guard !isLoading else { return }
+        let payload = Payload(
+            enabledGenres: enabledGenres,
+            countryBias: countryBias,
+            minBitrate: minBitrate,
+            preferredCodec: preferredCodec,
+            maxRecents: maxRecents,
+            showMenuBarIcon: showMenuBarIcon,
+            showDockIcon: showDockIcon,
+            autoResumeOnLaunch: autoResumeOnLaunch
+        )
+        if let data = try? JSONEncoder().encode(payload) {
+            UserDefaults.standard.set(data, forKey: Self.storageKey)
+        }
+    }
+
+    /// Toggle membership of a genre in `enabledGenres`, preserving existing order.
+    func toggleGenre(_ option: GenreOption) {
+        if let idx = enabledGenres.firstIndex(of: option) {
+            enabledGenres.remove(at: idx)
+        } else {
+            enabledGenres.append(option)
+        }
+    }
+
+    /// Toggle membership of a country in `countryBias`.
+    func toggleCountry(_ code: String) {
+        if let idx = countryBias.firstIndex(of: code) {
+            countryBias.remove(at: idx)
+        } else {
+            countryBias.append(code)
+        }
+    }
+}
+
+// MARK: - App Environment
+
+/// Weak registry so components living outside the SwiftUI view tree — the menu-bar
+/// controller in particular — can reach the active AudioManager / AllStationsState.
+/// ContentView registers these on `onAppear`. Accessed only from the main thread.
+final class AppEnvironment {
+    static let shared = AppEnvironment()
+    private init() {}
+
+    weak var audio: AudioManager?
+    weak var stations: AllStationsState?
+}
+
+// MARK: - Menu-Bar Controller
+
+/// Owns the `NSStatusItem` + its dropdown menu. Actions route through the shared
+/// `AppEnvironment` so we don't duplicate state. The menu rebuilds on every open so
+/// "Now Playing" reflects the current station title.
+final class MenuBarController: NSObject, NSMenuDelegate {
+    private var statusItem: NSStatusItem?
+    private weak var settings: AppSettings?
+    private var showWindowAction: (() -> Void)?
+    private var openSettingsAction: (() -> Void)?
+
+    func install(settings: AppSettings, showWindow: @escaping () -> Void, openSettings: @escaping () -> Void) {
+        self.settings = settings
+        self.showWindowAction = showWindow
+        self.openSettingsAction = openSettings
+        refreshVisibility()
+    }
+
+    /// Show or hide the status item to match the current `showMenuBarIcon` pref.
+    func refreshVisibility() {
+        guard let settings = settings else { return }
+        if settings.showMenuBarIcon {
+            if statusItem == nil { createStatusItem() }
+        } else {
+            if let item = statusItem {
+                NSStatusBar.system.removeStatusItem(item)
+                statusItem = nil
+            }
+        }
+    }
+
+    private func createStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = item.button {
+            button.image = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right", accessibilityDescription: "Swift Radio")
+            button.image?.isTemplate = true
+            button.toolTip = "Swift Radio"
+        }
+        let menu = NSMenu()
+        menu.delegate = self
+        item.menu = menu
+        statusItem = item
+        rebuildMenu()
+    }
+
+    // NSMenuDelegate — rebuild on open so Now Playing and pause-state are live.
+    func menuWillOpen(_ menu: NSMenu) { rebuildMenu() }
+
+    private func rebuildMenu() {
+        guard let menu = statusItem?.menu else { return }
+        menu.removeAllItems()
+
+        let env = AppEnvironment.shared
+        let nowPlayingTitle: String = {
+            if let name = env.audio?.currentStation?.name { return "♪ \(name)" }
+            return "Not Playing"
+        }()
+        let header = NSMenuItem(title: nowPlayingTitle, action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+
+        menu.addItem(.separator())
+
+        let isPlaying = (env.audio?.isPlaying ?? false) && !(env.audio?.isPaused ?? true)
+        let playPause = NSMenuItem(
+            title: isPlaying ? "Pause" : "Play",
+            action: #selector(togglePlayPause),
+            keyEquivalent: " "
+        )
+        playPause.keyEquivalentModifierMask = []
+        playPause.target = self
+        playPause.isEnabled = (env.audio?.currentStation != nil) || !(env.audio?.isPlaying ?? false)
+        menu.addItem(playPause)
+
+        let prev = NSMenuItem(title: "Previous Station", action: #selector(previousStation), keyEquivalent: "[")
+        prev.keyEquivalentModifierMask = [.command, .shift]
+        prev.target = self
+        menu.addItem(prev)
+
+        let next = NSMenuItem(title: "Next Station", action: #selector(nextStation), keyEquivalent: "]")
+        next.keyEquivalentModifierMask = [.command, .shift]
+        next.target = self
+        menu.addItem(next)
+
+        menu.addItem(.separator())
+
+        let show = NSMenuItem(title: "Show Swift Radio", action: #selector(showMainWindow), keyEquivalent: "0")
+        show.keyEquivalentModifierMask = [.command]
+        show.target = self
+        menu.addItem(show)
+
+        let prefs = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        prefs.keyEquivalentModifierMask = [.command]
+        prefs.target = self
+        menu.addItem(prefs)
+
+        menu.addItem(.separator())
+
+        let quit = NSMenuItem(title: "Quit Swift Radio", action: #selector(quit), keyEquivalent: "q")
+        quit.keyEquivalentModifierMask = [.command]
+        quit.target = self
+        menu.addItem(quit)
+    }
+
+    // MARK: Actions
+
+    @objc private func togglePlayPause() {
+        guard let audio = AppEnvironment.shared.audio else { return }
+        if audio.isPlaying {
+            audio.togglePause()
+            return
+        }
+        // Nothing playing yet — kick off the most-recent station if we have one.
+        if let station = AppEnvironment.shared.stations?.recentStations.first
+            ?? AppEnvironment.shared.stations?.favoriteStations.first {
+            audio.playStation(station)
+        }
+    }
+
+    @objc private func previousStation() { sweep(-1) }
+    @objc private func nextStation()     { sweep(1) }
+
+    private func sweep(_ direction: Int) {
+        guard let stations = AppEnvironment.shared.stations,
+              let audio = AppEnvironment.shared.audio else { return }
+        let list = stations.favoriteStations
+        guard !list.isEmpty else { return }
+        let startIndex: Int = {
+            if let cur = audio.currentStation?.id,
+               let i = list.firstIndex(where: { $0.id == cur }) { return i }
+            return 0
+        }()
+        var newIndex = startIndex + direction
+        if newIndex < 0 { newIndex = list.count - 1 }
+        if newIndex >= list.count { newIndex = 0 }
+        audio.playStation(list[newIndex])
+        stations.addRecent(list[newIndex])
+    }
+
+    @objc private func showMainWindow() {
+        showWindowAction?()
+    }
+
+    @objc private func openSettings() {
+        openSettingsAction?()
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
+    }
+}
+
+// MARK: - Settings Window Controller
+
+/// Floating settings panel — mirrors `DebugPanelController` so both panels feel
+/// consistent. Reuses `AppSettings.shared` as the source of truth.
+final class SettingsWindowController {
+    private var panel: NSPanel?
+
+    func open() {
+        if let p = panel {
+            p.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let view = SettingsView(settings: AppSettings.shared)
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 380, height: 560)
+
+        let p = NSPanel(
+            contentRect: NSRect(x: 240, y: 240, width: 380, height: 560),
+            styleMask: [.titled, .closable, .resizable, .utilityWindow, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        p.title = "Swift Radio — Settings"
+        p.contentView = hosting
+        p.isFloatingPanel = true
+        p.level = .floating
+        p.isReleasedWhenClosed = false
+        p.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        panel = p
+    }
+
+    func close() {
+        panel?.close()
+        panel = nil
+    }
+}
+
+// MARK: - Settings View
+
+struct SettingsView: View {
+    @ObservedObject var settings: AppSettings
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                header("Genre Tabs")
+                Text("Pick the genres shown in the All Stations browser. \"All Stations\" is always the first tab.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                genreGrid
+
+                Divider()
+
+                header("Country Bias")
+                Text("The All Stations and genre lists are pooled from these countries, sorted by community votes.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                countryGrid
+
+                Divider()
+
+                header("Playback")
+                playbackSection
+
+                Divider()
+
+                header("Behavior")
+                behaviorSection
+            }
+            .padding(18)
+        }
+        .frame(minWidth: 360, minHeight: 520)
+    }
+
+    // MARK: Sections
+
+    private func header(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 13, weight: .semibold))
+    }
+
+    private var genreGrid: some View {
+        let columns = [GridItem(.adaptive(minimum: 110), spacing: 8)]
+        return LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
+            ForEach(GenreOption.allOptions) { option in
+                let on = settings.enabledGenres.contains(option)
+                Button(action: { settings.toggleGenre(option) }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                            .foregroundColor(on ? .accentColor : .secondary)
+                        Text(option.displayName)
+                            .font(.system(size: 12))
+                            .foregroundColor(.primary)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color.secondary.opacity(on ? 0.18 : 0.08))
+                    )
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var countryGrid: some View {
+        let columns = [GridItem(.adaptive(minimum: 150), spacing: 8)]
+        return LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
+            ForEach(CountryOption.catalog) { country in
+                let on = settings.countryBias.contains(country.code)
+                Button(action: { settings.toggleCountry(country.code) }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                            .foregroundColor(on ? .accentColor : .secondary)
+                        Text(country.name)
+                            .font(.system(size: 12))
+                            .foregroundColor(.primary)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                        Text(country.code)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color.secondary.opacity(on ? 0.18 : 0.08))
+                    )
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var playbackSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Minimum bitrate")
+                    .font(.system(size: 12))
+                Spacer()
+                Text("\(settings.minBitrate) kbps")
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(.secondary)
+            }
+            Slider(
+                value: Binding(
+                    get: { Double(settings.minBitrate) },
+                    set: { settings.minBitrate = Int($0.rounded()) }
+                ),
+                in: 64...320, step: 16
+            )
+
+            HStack {
+                Text("Preferred codec")
+                    .font(.system(size: 12))
+                Spacer()
+                Picker("", selection: $settings.preferredCodec) {
+                    Text("MP3").tag("MP3")
+                    Text("AAC").tag("AAC")
+                    Text("Any").tag("Any")
+                }
+                .labelsHidden()
+                .frame(width: 100)
+            }
+
+            HStack {
+                Text("Max Recents")
+                    .font(.system(size: 12))
+                Spacer()
+                Stepper(value: $settings.maxRecents, in: 5...50, step: 5) {
+                    Text("\(settings.maxRecents)")
+                        .font(.system(size: 12, design: .monospaced))
+                }
+                .frame(width: 140)
+            }
+        }
+    }
+
+    private var behaviorSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("Show menu-bar icon", isOn: $settings.showMenuBarIcon)
+                .font(.system(size: 12))
+            Toggle("Show Dock icon", isOn: $settings.showDockIcon)
+                .font(.system(size: 12))
+            Toggle("Auto-resume last station on launch", isOn: $settings.autoResumeOnLaunch)
+                .font(.system(size: 12))
+        }
+    }
+}
+
+// MARK: - App Delegate
+
+/// Coordinates the menu-bar status item, Settings panel, and activation-policy
+/// changes. Owned via `@NSApplicationDelegateAdaptor` on `AV_TesterApp`.
+final class RadioAppDelegate: NSObject, NSApplicationDelegate {
+    private let menuBar = MenuBarController()
+    private let settingsWindow = SettingsWindowController()
+    private var cancellables: Set<AnyCancellable> = []
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let settings = AppSettings.shared
+        applyActivationPolicy(showDockIcon: settings.showDockIcon)
+
+        menuBar.install(
+            settings: settings,
+            showWindow: { [weak self] in self?.showMainWindow() },
+            openSettings: { [weak self] in self?.settingsWindow.open() }
+        )
+
+        // Keep menu-bar visibility + dock icon in sync with Settings toggles.
+        settings.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    self?.menuBar.refreshVisibility()
+                    self?.applyActivationPolicy(showDockIcon: settings.showDockIcon)
+                }
+            }
+            .store(in: &cancellables)
+
+        // Listen for Cmd+, / "Settings…" from the main window.
+        NotificationCenter.default.addObserver(
+            forName: .openSettingsRequested,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.settingsWindow.open() }
+        }
+    }
+
+    /// Hide/show the Dock icon at runtime. `.accessory` keeps the app running
+    /// without a Dock tile (menu-bar-only feel); `.regular` restores normal.
+    private func applyActivationPolicy(showDockIcon: Bool) {
+        let desired: NSApplication.ActivationPolicy = showDockIcon ? .regular : .accessory
+        if NSApp.activationPolicy() != desired {
+            NSApp.setActivationPolicy(desired)
+        }
+    }
+
+    private func showMainWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        // Prefer a non-panel, non-settings window — our main ContentView scene.
+        for window in NSApp.windows {
+            if !(window is NSPanel) && window.canBecomeMain {
+                window.makeKeyAndOrderFront(nil)
+                return
+            }
+        }
+        // Fallback: just front whatever we have.
+        NSApp.windows.first?.makeKeyAndOrderFront(nil)
+    }
+}
+
 // MARK: - App Entry Point
 
 /// Notification fired when the user invokes the standard macOS Settings shortcut (Cmd+,)
-/// or chooses the Settings menu item. ContentView listens for this to toggle the
-/// Tweak panel in-place — aligning with HIG "Cmd+, opens Settings" convention.
+/// or chooses the Settings menu item. The AppDelegate listens for this and opens the
+/// Settings panel.
 extension Notification.Name {
     static let openSettingsRequested = Notification.Name("SwiftRadio.openSettingsRequested")
 }
 
 @main
 struct AV_TesterApp: App {
+    @NSApplicationDelegateAdaptor(RadioAppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -3848,9 +4542,8 @@ struct AV_TesterApp: App {
         .windowResizability(.contentSize)
         .windowStyle(.hiddenTitleBar)
         .commands {
-            // HIG: Cmd+, is the universal macOS Settings shortcut. Replace the default
-            // (which opens a separate Settings scene) with a notification that our
-            // ContentView receives and uses to toggle the Tweak panel.
+            // HIG: Cmd+, is the universal macOS Settings shortcut. Opens the Settings
+            // panel (menu-bar preferences); the in-place Tweak panel is on 'D'.
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") {
                     NotificationCenter.default.post(name: .openSettingsRequested, object: nil)
