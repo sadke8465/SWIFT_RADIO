@@ -78,11 +78,24 @@ The visualizer below the transport shows a 6-band frequency spectrum that reacts
 | `Esc` | Clear search filter, or exit browser if no filter active |
 | `M` or `Shift+F10` | Open context menu |
 
-### Search Bar
+### Search Bar (Global Command Palette)
+
+Open from anywhere with `Cmd+K` (or `Cmd+F`, `/`, or `S` inside the browser). Queries run
+live against the Radio Browser API — not just the current list — so you can find any
+of ~40k stations in a single bar.
+
+The bar intelligently parses a single input into multiple fields:
+
+| You type | Parsed as |
+|----------|-----------|
+| `Jazz Israel` | tag=jazz, country=IL |
+| `United States NPR` | country=US, name="NPR" |
+| `News` | tag=news |
+| `KAN GIMEL` | name="KAN GIMEL" |
 
 | Key | Action |
 |-----|--------|
-| Type | Filter stations in real time |
+| Type | Runs a debounced (300ms) API search across name, country, and genre |
 | `Backspace` | Remove last character (closes bar when empty) |
 | `↓` | Move focus into results list |
 | `Enter` | Play highlighted result and close search |
