@@ -2607,7 +2607,7 @@ struct AllStationsView: View {
                     }
                     .accessibilityRole(.tab)
                     .accessibilityLabel(genre)
-                    .accessibilityAddTraits(idx == state.selectedGenreIndex ? .isSelected : [])
+                    .accessibilityAddTraits(idx == state.selectedGenreIndex ? .isSelected : AccessibilityTraits())
             }
         }
     }
