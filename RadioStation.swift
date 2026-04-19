@@ -2605,9 +2605,8 @@ struct AllStationsView: View {
                             state.setGenre(to: idx)
                         }
                     }
-                    .accessibilityRole(.tab)
                     .accessibilityLabel(genre)
-                    .accessibilityAddTraits(idx == state.selectedGenreIndex ? .isSelected : AccessibilityTraits())
+                    .accessibilityAddTraits(idx == state.selectedGenreIndex ? [.isButton, .isSelected] : .isButton)
             }
         }
     }
@@ -2757,7 +2756,7 @@ struct TransportButton: View {
                     }
                 }
             }
-            .accessibilityRole(.button)
+            .accessibilityAddTraits(.isButton)
             .accessibilityLabel(a11yLabel.isEmpty ? label : a11yLabel)
     }
 }
@@ -2798,7 +2797,7 @@ struct PlayPauseButton: View {
                 }
             }
         }
-        .accessibilityRole(.button)
+        .accessibilityAddTraits(.isButton)
         .accessibilityLabel(showPlayGlyph ? "Play" : "Pause")
     }
 }
@@ -3158,10 +3157,9 @@ struct ContentView: View {
         .onTapGesture {
             enterAllStations()
         }
-        .accessibilityRole(.button)
         .accessibilityLabel("All Stations")
         .accessibilityHint("Browse all available stations")
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
     }
 
     @ViewBuilder
@@ -3899,7 +3897,6 @@ struct ContentView: View {
             contextMenuFocusIndex = index
             if index == 2 { contextMenuStation = nil } else { executeContextMenuAction() }
         }
-        .accessibilityRole(.button)
         .accessibilityLabel(label)
         .accessibilityAddTraits(index == contextMenuFocusIndex ? [.isSelected, .isButton] : .isButton)
     }
@@ -4049,7 +4046,6 @@ struct ContentView: View {
             )
             .contentShape(Rectangle())
             .onTapGesture { action() }
-            .accessibilityRole(.button)
             .accessibilityLabel(label)
             .accessibilityAddTraits(isFocused ? [.isSelected, .isButton] : .isButton)
     }
